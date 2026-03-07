@@ -21,9 +21,27 @@ async function getTabSessionId() {
   return _tabSessionId;
 }
 
-const BACKEND     = "http://localhost:8000";
-const BACKEND_URL = BACKEND;
+const DEFAULT_BACKEND = "http://localhost:8000";
+// BACKEND is resolved from chrome.storage.local at startup (see _initBackend).
+// All code uses the `BACKEND` variable; it is reassigned before any user action.
+let BACKEND     = DEFAULT_BACKEND;
+let BACKEND_URL = DEFAULT_BACKEND;
 let lastScreenContext = {};
+
+// Read persisted backend URL from storage, update module variables and the
+// settings input, then inject updated config into the active tab's
+// vision_observer if it is already running.
+async function _initBackend() {
+  const data = await chrome.storage.local.get("gopilotBackendUrl");
+  const stored = (data.gopilotBackendUrl || "").trim().replace(/\/$/, "");
+  if (stored) {
+    BACKEND     = stored;
+    BACKEND_URL = stored;
+  }
+  const inp = document.getElementById("backend-url-input");
+  if (inp) inp.value = BACKEND;
+}
+_initBackend();
 
 // ── DOM refs ──────────────────────────────────────────────────────────────
 const micBtn        = document.getElementById("mic-btn");
@@ -829,3 +847,43 @@ copilotToggle.addEventListener("change", async () => {
     });
   } catch (e) { console.warn("[GoPilot] Toggle failed:", e.message); }
 });
+// ── Settings panel ────────────────────────────────────────────────────────
+const settingsBtn   = document.getElementById("settings-btn");
+const settingsPanel = document.getElementById("settings-panel");
+const backendInput  = document.getElementById("backend-url-input");
+const saveBackendBtn= document.getElementById("save-backend-btn");
+
+if (settingsBtn && settingsPanel) {
+  settingsBtn.addEventListener("click", () => {
+    settingsPanel.classList.toggle("open");
+    // Refresh input in case storage changed externally
+    if (backendInput) backendInput.value = BACKEND;
+  });
+}
+
+if (saveBackendBtn && backendInput) {
+  saveBackendBtn.addEventListener("click", async () => {
+    const val = backendInput.value.trim().replace(/\/$/, "");
+    if (!val) return;
+    // Validate it looks like a URL
+    if (!/^https?:\/\/.+/.test(val)) {
+      backendInput.style.borderColor = "var(--danger)";
+      setTimeout(() => backendInput.style.borderColor = "", 1500);
+      return;
+    }
+    BACKEND     = val;
+    BACKEND_URL = val;
+    await chrome.storage.local.set({ gopilotBackendUrl: val });
+    // Tell vision_observer running in the active tab about the new URL
+    try {
+      const tab = await getActiveTab();
+      await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func:   (url) => { if (window.__copilotSetBackend) window.__copilotSetBackend(url); },
+        args:   [val],
+      });
+    } catch (_) {}
+    settingsPanel.classList.remove("open");
+    console.log("[GoPilot] Backend URL updated to:", val);
+  });
+}

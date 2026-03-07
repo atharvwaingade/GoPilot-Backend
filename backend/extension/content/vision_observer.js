@@ -6,6 +6,7 @@
  *   - Toggle ON/OFF state tracked (reads from chrome.storage.local)
  *   - Plays TTS audio from backend directly on navigation
  *   - Exposes window.__copilotToggle(enabled) for popup to call
+ *   - Exposes window.__copilotSetBackend(url) so popup can change backend URL
  */
 
 (function () {
@@ -15,8 +16,11 @@
   window.__copilotVisionObserverLoaded = true;
 
   // ── Config ────────────────────────────────────────────────────────────────
-  const BACKEND       = "http://localhost:8000";
-  const WS_URL        = "ws://localhost:8000/ws/vision";
+  const DEFAULT_BACKEND = "http://localhost:8000";
+  // BACKEND and WS_URL are mutable so popup can update them at runtime via
+  // window.__copilotSetBackend(url).
+  let BACKEND       = DEFAULT_BACKEND;
+  let WS_URL        = `${DEFAULT_BACKEND.replace(/^http/, "ws")}/ws/vision`;
   const POLL_INTERVAL = 800;
   const DEBOUNCE_MS   = 200;
   const RECONNECT_MS  = 3000;
@@ -35,8 +39,14 @@
   let currentUrl     = location.href;
   let copilotEnabled = false;   // tracks toggle state
 
-  // ── Load toggle state from storage ───────────────────────────────────────
-  chrome.storage.local.get(["copilotEnabled", "lastAnnouncedUrl"], (result) => {
+  // ── Load toggle state + backend URL from storage ──────────────────────────
+  chrome.storage.local.get(["copilotEnabled", "lastAnnouncedUrl", "gopilotBackendUrl"], (result) => {
+    // Apply persisted backend URL (allows non-default host/port without editing source)
+    const stored = (result.gopilotBackendUrl || "").trim().replace(/\/$/, "");
+    if (stored) {
+      BACKEND = stored;
+      WS_URL  = `${stored.replace(/^http/, "ws")}/ws/vision`;
+    }
     copilotEnabled = result.copilotEnabled === true;
     if (copilotEnabled) {
       // Only re-announce if this is a genuinely new page (not a popup re-open)
@@ -49,7 +59,21 @@
         }, 1200);
       }
     }
+    // Connect WebSocket after URL is resolved
+    connectWS();
   });
+
+  // Allow popup to update backend URL at runtime (applied to future fetch/WS calls).
+  // The WebSocket reconnect loop will pick up WS_URL on its next retry.
+  window.__copilotSetBackend = function(url) {
+    if (!url) return;
+    const clean = url.trim().replace(/\/$/, "");
+    BACKEND = clean;
+    WS_URL  = `${clean.replace(/^http/, "ws")}/ws/vision`;
+    // Force WebSocket reconnect so it uses the new URL immediately
+    if (ws) { try { ws.close(); } catch(_) {} }
+    console.log("[GoPilot] Backend URL updated to:", clean);
+  };
 
   // ── WebSocket ─────────────────────────────────────────────────────────────
 
@@ -416,7 +440,8 @@
   }
 
   // ── Start ─────────────────────────────────────────────────────────────────
-  connectWS();
+  // connectWS() is called inside the chrome.storage.local.get callback above
+  // so it uses the resolved (possibly user-configured) WS_URL.
   console.log("[GoPilot Vision] Observer v2 active — session:", SESSION_ID);
 
 })();

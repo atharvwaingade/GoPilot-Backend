@@ -4,12 +4,27 @@ pydantic==2.7.1
 pydantic-settings==2.2.1
 requests==2.32.3
 python-multipart==0.0.9
-# STT — OpenAI Whisper (no HuggingFace account required, supports all Indian languages)
+
+# ── STT — OpenAI Whisper ────────────────────────────────────────────────────
+# No HuggingFace account required. Supports all Indian languages + Hinglish.
 openai-whisper==20231117
 torch>=2.1.0
 torchaudio>=2.1.0
-# TTS — Indic Parler-TTS (install separately: pip install git+https://github.com/ai4bharat/indic-parler-tts)
+# Used by stt_engine.py to decode WAV/FLAC without ffmpeg (soundfile) and
+# WebM/MP3/OGG via pure Python (pydub — optional, install for browser audio).
 soundfile>=0.12.1
-simpleaudio==1.0.4
-# transformers still needed for TTS model
+pydub>=0.25.1
+
+# ── TTS — Kokoro (recommended, local, no auth) ─────────────────────────────
+# Fast, high-quality local TTS. ~300 MB download on first use.
+# Install: pip install kokoro soundfile
+# (soundfile already listed above)
+kokoro>=0.9.2
+
+# ── Audio playback (optional — only needed when play=True is set) ──────────
+# Used by tts_engine.py._play_wav() for server-side audio monitoring.
+sounddevice>=0.4.6
+
+# ── transformers — needed by Parler-TTS fallback (optional) ────────────────
+# Can be removed if kokoro is the only TTS backend used.
 transformers>=4.40.0
