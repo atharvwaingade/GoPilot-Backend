@@ -1,0 +1,713 @@
+"""
+page_explainer.py — Instant page understanding with LLM fallback
+
+Architecture:
+  1. FieldDescriber  — static knowledge base of ERP/form terms → instant answers (~0ms)
+  2. DOM analyser    — reads screen_context structure directly → instant answers (~0ms)
+  3. LLM fallback    — only for unknown fields / complex how-to questions (~5-10s)
+
+Before: Every "what is HSN code?" hit the LLM → 5-10s wait.
+After:  Known ERP terms answered in <1ms. LLM only for truly unknown things.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import re
+from dataclasses import dataclass, field
+from typing import Callable
+
+logger = logging.getLogger(__name__)
+
+MAX_EXPLAIN_CHARS = 3000
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 1: DATA CLASSES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class FieldInsight:
+    field_id:        str
+    label:           str
+    current_value:   str | None
+    is_required:     bool
+    is_filled:       bool
+    is_readonly:     bool
+    suggested_value: str | None   # from user instruction or context
+
+
+@dataclass
+class PageInsight:
+    page_title:        str
+    page_url:          str
+    page_purpose:      str            # one sentence: "This is a purchase order form…"
+    total_fields:      int
+    filled_fields:     int
+    required_missing:  list[str]      # field_ids still empty
+    field_insights:    list[FieldInsight]
+    navigable_actions: list[str]      # button/link labels the agent can click
+    completion_pct:    float          # 0-100
+    raw_explanation:   str            # voice-ready text
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 2: FIELD DESCRIBER — Static ERP Knowledge Base
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class FieldDescriber:
+    """
+    Instant answers to "what is X?" questions from a static ERP glossary.
+
+    Lookup order:
+      1. Exact match on field_id or label slug
+      2. Keyword match — any glossary key that appears in the question
+      3. Return None → caller falls back to LLM
+
+    Adding terms: edit _GLOSSARY below. Keys are lowercase slugs.
+    """
+
+    # ── ERP / GST / Accounting glossary ───────────────────────────────────
+    _GLOSSARY: dict[str, str] = {
+        # GST-related
+        "hsn":
+            "HSN stands for Harmonized System of Nomenclature. It's a 6-8 digit code "
+            "that classifies your product for GST purposes. Every goods item needs one "
+            "for a valid tax invoice.",
+        "hsn code":
+            "HSN stands for Harmonized System of Nomenclature. It's a 6-8 digit code "
+            "that classifies your product for GST purposes. Every goods item needs one.",
+        "hsn sac code":
+            "HSN is for goods, SAC is for services. Both are classification codes "
+            "required on GST invoices. Enter the 4-8 digit code for your item.",
+        "sac":
+            "SAC stands for Services Accounting Code — the GST classification code "
+            "for services, similar to HSN for goods.",
+        "cgst":
+            "CGST is Central Goods and Services Tax — the portion of GST that goes "
+            "to the central government. It's auto-calculated based on the tax rate and "
+            "supply type. You don't need to enter this manually.",
+        "cgst percent":
+            "CGST Percent is the Central GST rate applied to this item. "
+            "It's auto-calculated — you don't need to fill it manually.",
+        "sgst":
+            "SGST is State Goods and Services Tax — the state government's share of GST. "
+            "It equals the CGST rate and is auto-calculated. No manual entry needed.",
+        "sgst percent":
+            "SGST Percent is the State GST rate. It equals the CGST rate and is "
+            "auto-calculated based on the supply type.",
+        "igst":
+            "IGST is Integrated Goods and Services Tax — applied on inter-state "
+            "transactions instead of CGST and SGST combined. Auto-calculated.",
+        "igst percent":
+            "IGST Percent applies to inter-state supply. It combines CGST and SGST "
+            "into a single tax. Auto-calculated when supply type is inter-state.",
+        "gst":
+            "GST is Goods and Services Tax — India's unified indirect tax system. "
+            "It replaces multiple state and central taxes. Rates are 0%, 5%, 12%, 18%, or 28%.",
+        "supply type":
+            "Supply Type determines whether this transaction is INSTATE (within the same state, "
+            "attracting CGST + SGST) or INTERSTATE (across states, attracting IGST).",
+
+        # Invoice / Purchase Order fields
+        "invoice no":
+            "Invoice Number is the unique identifier for this purchase document. "
+            "It's usually auto-generated by the system. You can leave it as-is unless "
+            "you have a supplier-provided invoice number to record.",
+        "invoice number":
+            "Invoice Number uniquely identifies this purchase record. "
+            "It's auto-generated — no need to change it unless recording a supplier invoice.",
+        "invoice":
+            "An invoice is the official billing document for this purchase transaction. "
+            "The Invoice Number field tracks it uniquely.",
+        "purchase amount":
+            "Purchase Amount is the total cost of this item before any taxes. "
+            "It's calculated automatically from quantity times rate per unit.",
+        "total purchase":
+            "Total Purchase is the grand total including taxes. "
+            "It's auto-calculated from all items on this invoice.",
+        "rate per unit":
+            "Rate Per Unit is the price of one unit of this product. "
+            "Enter the supplier's quoted price here.",
+        "price code":
+            "Price Code is a lookup code that maps to a predefined price tier "
+            "in your system. It helps apply standardised pricing for this product.",
+
+        # Product fields
+        "product name":
+            "Product Name is the name of the item you're purchasing or selling. "
+            "Enter the full name as it appears on the supplier's invoice.",
+        "product code":
+            "Product Code is your internal code for this product. "
+            "It helps track the item across purchase and sales records.",
+        "category":
+            "Category classifies the type of product — for example, Furniture, "
+            "Electronics, or Raw Material. It's used for reporting and GST classification.",
+        "barcode":
+            "Barcode is the EAN or UPC barcode for this product. "
+            "It's used for scanning at the point of receipt or sale.",
+
+        # Quantities and units
+        "total quantity":
+            "Total Quantity is how many units of this product are being purchased. "
+            "Enter the number from the supplier's invoice.",
+        "received qty":
+            "Received Quantity is how many units you actually received. "
+            "This may differ from the ordered quantity if there was a partial delivery.",
+        "missing qty":
+            "Missing Quantity is the difference between ordered and received. "
+            "It's auto-calculated: Total Quantity minus Received Quantity.",
+        "unit":
+            "Unit is the measurement unit for this product — for example, "
+            "Pieces (PCS), Kilograms (KG), Litres (L), or Boxes (BOX).",
+        "print quantity":
+            "Print Quantity is how many labels or tags to print for this item. "
+            "Usually matches the received quantity.",
+
+        # Dates
+        "date":
+            "Date is the transaction date for this purchase — typically today's date "
+            "or the date on the supplier's invoice.",
+        "purchase date":
+            "Purchase Date is when this purchase was made. "
+            "Enter it in DD/MM/YYYY format or use today's date.",
+
+        # Parties
+        "supplier":
+            "Supplier is the vendor or company you're purchasing from. "
+            "Select from the dropdown or type the supplier's name.",
+        "customer":
+            "Customer is the person or company buying from you. "
+            "Select from the list or enter their name.",
+
+        # Payment and credit
+        "credit amount":
+            "Credit Amount is the outstanding credit available from this supplier. "
+            "It's calculated from previous transactions.",
+        "debit amount":
+            "Debit Amount is the amount owed to this supplier from previous transactions.",
+        "paid":
+            "Paid is the amount you've already paid to this supplier for this invoice.",
+        "after discount":
+            "After Discount shows the price after applying any negotiated discount.",
+        "packing charges":
+            "Packing Charges are additional costs charged by the supplier for packaging. "
+            "Enter the amount from the invoice if applicable.",
+        "total amount":
+            "Total Amount is the final payable amount including all taxes and charges. "
+            "It's auto-calculated.",
+        "to pay":
+            "To Pay is the remaining balance after subtracting credit and payments already made.",
+        "payment mode":
+            "Payment Mode is how you're paying — Cash, Cheque, Bank Transfer, or UPI.",
+
+        # Sell / Sales fields
+        "sell price":
+            "Sell Price is the price at which you're selling this product to the customer.",
+        "selling price":
+            "Selling Price is your listed price for this item per unit.",
+
+        # Material and size
+        "material":
+            "Material describes what the product is made from — e.g., Wood, Metal, Fabric.",
+        "size":
+            "Size is the physical dimensions or size variant of the product — "
+            "e.g., Small, Medium, Large, or specific measurements.",
+        "color":
+            "Color is the colour variant of this product.",
+        "colour":
+            "Colour is the colour variant of this product.",
+
+        # Image
+        "image":
+            "Image lets you attach a photo of this product. "
+            "Click 'Choose File' to upload an image from your computer.",
+    }
+
+    # Normalise a string to a lookup key
+    @staticmethod
+    def _slug(text: str) -> str:
+        """'(प्रकार) Category *' → 'category'"""
+        t = re.sub(r"\([^)]*\)", "", text)              # strip (Marathi)
+        t = re.sub(r"[\u0900-\u0D7F]+", "", t)          # strip Indic
+        t = re.sub(r"[*†‡§¶#@!?:/\\|_\-]+", " ", t)   # strip symbols
+        return t.lower().strip()
+
+    def describe(self, query: str, field_id: str = "", label: str = "") -> str | None:
+        """
+        Look up an instant description for a field or question.
+
+        Args:
+            query:    The user's question or field name to look up.
+            field_id: The field's ID (optional, used as additional lookup key).
+            label:    The field's label (optional).
+
+        Returns:
+            A human-readable description string, or None if not found
+            (caller should fall back to the LLM).
+        """
+        candidates = [
+            self._slug(query),
+            self._slug(label),
+            self._slug(field_id.replace("_", " ")),
+        ]
+
+        # 1. Exact match on any candidate
+        for c in candidates:
+            if c and c in self._GLOSSARY:
+                logger.debug("FieldDescriber: exact match '%s'", c)
+                return self._GLOSSARY[c]
+
+        # 2. Keyword match — find any glossary key that appears in the query slug
+        query_slug = self._slug(query)
+        for key, description in self._GLOSSARY.items():
+            if key in query_slug or query_slug in key:
+                logger.debug("FieldDescriber: keyword match '%s' in '%s'", key, query_slug)
+                return description
+
+        # 3. Word-level match — all words of a glossary key appear in the query
+        query_words = set(query_slug.split())
+        for key, description in self._GLOSSARY.items():
+            key_words = set(key.split())
+            if key_words and key_words.issubset(query_words):
+                logger.debug("FieldDescriber: word match '%s'", key)
+                return description
+
+        logger.debug("FieldDescriber: no match for '%s'", query_slug)
+        return None
+
+
+# ── Module-level singleton ─────────────────────────────────────────────────────
+field_describer = FieldDescriber()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 3: DOM ANALYSER — Instant structural queries
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _all_fields(context: dict) -> list[dict]:
+    """Flatten all fields from all sections."""
+    return [f for s in context.get("sections", []) for f in s.get("fields", [])]
+
+
+def _clean_label(label: str, field_id: str = "") -> str:
+    """Return a clean human-readable name for a field."""
+    l = re.sub(r"\([^)]*\)", "", label).strip()      # strip (Marathi)
+    l = re.sub(r"[\u0900-\u0D7F]+", "", l).strip()   # strip Indic chars
+    l = re.sub(r"[*†]+", "", l).strip()               # strip asterisks
+    if l:
+        return l
+    return field_id.replace("_", " ").title()
+
+
+# Question patterns that the DOM analyser can answer instantly
+_LIST_FIELDS_RE   = re.compile(r"\b(list|show|what|which)\b.*(field|fields|input|form)", re.I)
+_REQUIRED_RE      = re.compile(r"\b(required|mandatory|must|need)\b", re.I)
+_MISSING_RE       = re.compile(r"\b(missing|empty|unfilled|incomplete)\b", re.I)
+_FILLED_RE        = re.compile(r"\b(filled|done|complete)\b", re.I)
+_STATUS_RE        = re.compile(r"\b(status|overview|summary|how many)\b", re.I)
+_BUTTONS_RE       = re.compile(r"\b(buttons?|actions?|submit|click|nav)\b", re.I)
+# "tell me about this page" / "what page am I on" / "where am I" / "describe this page"
+_PAGE_DESC_RE     = re.compile(
+    r"\b(tell me about|about this page|what page|where am i|which page|"
+    r"describe this|what is this|what form|this page|current page|"
+    r"page (info|details|overview)|kaunsa page|kontha page)\b",
+    re.I,
+)
+
+
+def _try_dom_answer(instruction: str, context: dict) -> str | None:
+    """
+    Answer structural questions directly from DOM data without any LLM call.
+
+    Returns a voice-ready answer string, or None if the question needs LLM.
+    """
+    instr = instruction.lower().strip()
+    fields = _all_fields(context)
+
+    # ── "Tell me about this page / what page am I on?" ───────────────────
+    if _PAGE_DESC_RE.search(instr):
+        page      = context.get("page", {})
+        title     = page.get("title", "") or ""
+        url       = page.get("page_id", "") or page.get("url", "")
+        fillable  = [f for f in fields if not f.get("readonly") and not f.get("calculated")]
+        req       = [f for f in fields if f.get("required")]
+        missing   = [f for f in req if not (f.get("value") and str(f["value"]).strip())]
+
+        # Detect page type from URL + title + field IDs
+        combined = f"{url} {title} {' '.join(f.get('field_id','') for f in fields)}".lower()
+        if re.search(r"purchase|khareedi|procure", combined):
+            form_name = "a Purchase Order form"
+            purpose   = "for recording incoming stock from suppliers"
+        elif re.search(r"sales|sell|vikri|invoice", combined):
+            form_name = "a Sales Order form"
+            purpose   = "for recording sales to your customers"
+        elif re.search(r"supplier|vendor|saplayer", combined):
+            form_name = "a Supplier form"
+            purpose   = "for managing your suppliers"
+        elif re.search(r"customer|client|grahak", combined):
+            form_name = "a Customer form"
+            purpose   = "for managing your customers"
+        elif re.search(r"stock|inventory|item", combined):
+            form_name = "an Item Details form"
+            purpose   = "for managing product stock and inventory"
+        elif re.search(r"dashboard|home", combined):
+            form_name = "the Dashboard"
+            purpose   = "your main overview page"
+        else:
+            form_name = f"a form called '{title}'" if title else "a form"
+            purpose   = "for data entry"
+
+        parts = [f"You're on {form_name} — {purpose}."]
+        if fillable:
+            parts.append(f"It has {len(fillable)} fillable fields.")
+        if missing:
+            names = ", ".join(
+                re.sub(r"[\(][^)]*[\)]|[\u0900-\u0D7F]+|[*†]+", "", f.get("label","")).strip()
+                for f in missing[:3]
+            )
+            extra = f" and {len(missing)-3} more" if len(missing) > 3 else ""
+            parts.append(f"{len(missing)} required {'field is' if len(missing)==1 else 'fields are'} still empty: {names}{extra}.")
+            parts.append("Say 'fill required fields' to get started.")
+        elif req:
+            parts.append("All required fields are already filled — ready to submit.")
+        # Add table summary if this is a list page
+        try:
+            from voice.table_reader import build_table_page_summary, has_table_data
+            if has_table_data(context):
+                tbl_summary = build_table_page_summary(context)
+                if tbl_summary:
+                    parts.append(tbl_summary)
+                    parts.append("Say 'how many pending' or 'show me last 5' to hear details.")
+        except Exception:
+            pass
+        return " ".join(parts)
+
+    # ── "What fields are missing / empty?" ────────────────────────────────
+    # Check BEFORE list-all so "what fields are missing" hits here, not below
+    if _MISSING_RE.search(instr):
+        missing = [
+            _clean_label(f.get("label",""), f.get("field_id",""))
+            for f in fields
+            if f.get("required") and not (f.get("value") and str(f["value"]).strip())
+        ]
+        if not missing:
+            return "All required fields are filled. You're ready to submit."
+        return f"Missing required fields: {', '.join(missing[:8])}."
+
+    # ── "Which fields are required?" ───────────────────────────────────────
+    if _REQUIRED_RE.search(instr):
+        required = [
+            _clean_label(f.get("label",""), f.get("field_id",""))
+            for f in fields if f.get("required")
+        ]
+        if not required:
+            return "I don't see any required fields marked on this page."
+        return f"The required fields are: {', '.join(required[:10])}."
+
+    # ── "What fields are on this page?" / "list all fields" ───────────────
+    if _LIST_FIELDS_RE.search(instr) and not _REQUIRED_RE.search(instr):
+        fillable = [
+            _clean_label(f.get("label",""), f.get("field_id",""))
+            for f in fields
+            if not f.get("readonly") and not f.get("calculated")
+        ]
+        if not fillable:
+            return "I don't see any fillable fields on this page."
+        names = ", ".join(fillable[:12])
+        suffix = f" and {len(fillable)-12} more" if len(fillable) > 12 else ""
+        return f"The fillable fields on this page are: {names}{suffix}."
+
+    # ── "What's filled / what's done?" ────────────────────────────────────
+    if _FILLED_RE.search(instr) and not _MISSING_RE.search(instr):
+        filled = [
+            _clean_label(f.get("label",""), f.get("field_id",""))
+            for f in fields
+            if f.get("value") and str(f["value"]).strip()
+            and not f.get("readonly") and not f.get("calculated")
+        ]
+        if not filled:
+            return "No fields have been filled in yet."
+        return f"Filled fields so far: {', '.join(filled[:8])}."
+
+    # ── "What's the status?" / "give me an overview" ──────────────────────
+    if _STATUS_RE.search(instr):
+        total  = len(fields)
+        filled = sum(1 for f in fields if f.get("value") and str(f["value"]).strip())
+        req    = [f for f in fields if f.get("required")]
+        miss   = [f for f in req if not (f.get("value") and str(f["value"]).strip())]
+        pct    = round(filled/total*100) if total else 0
+        page   = context.get("page", {}).get("title", "this page")
+        return (
+            f"On {page}: {total} fields total, {filled} filled ({pct}% complete). "
+            f"{len(miss)} required fields still need values."
+        )
+
+    # ── "What buttons are available?" ─────────────────────────────────────
+    if _BUTTONS_RE.search(instr):
+        buttons = [
+            b.get("label","") for b in context.get("buttons", [])
+            if not b.get("disabled") and b.get("label")
+        ]
+        if not buttons:
+            return "I don't see any active buttons on this page."
+        return f"Available actions: {', '.join(buttons[:6])}."
+
+    return None  # DOM can't answer — fall through to LLM
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 4: LLM-BACKED EXPLAIN (fallback only)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _slim_context_for_explain(context: dict) -> str:
+    """Compact text representation of DOM for LLM prompt."""
+    lines = []
+    page  = context.get("page", {})
+    lines.append(f"PAGE: {page.get('title','Unknown')} | URL: {page.get('page_id','')}")
+    lines.append("")
+
+    for section in context.get("sections", []):
+        lines.append(f"SECTION: {section.get('title','Section')}")
+        for f in section.get("fields", []):
+            fid     = f.get("field_id", "")
+            label   = f.get("label", fid)
+            value   = f.get("value", "")
+            req     = "REQUIRED" if f.get("required") else ""
+            ro      = "READONLY" if f.get("readonly") else ""
+            flags   = " ".join(filter(None, [req, ro]))
+            val_str = f'="{value}"' if value else "=(empty)"
+            lines.append(f"  [{fid}] {label}{val_str} {flags}".rstrip())
+
+    lines.append("")
+    btns = [
+        b.get("label", b.get("button_id",""))
+        for b in context.get("buttons", []) if not b.get("disabled")
+    ]
+    if btns:
+        lines.append(f"BUTTONS: {', '.join(btns[:8])}")
+
+    return "\n".join(lines)[:MAX_EXPLAIN_CHARS]
+
+
+_EXPLAIN_SYSTEM = """\
+You are a visual assistant analyzing a web form or page structure.
+Given the page's DOM summary, respond ONLY in this exact JSON format:
+
+{
+  "page_purpose": "One sentence describing what this page/form does",
+  "field_summary": [
+    {"field_id": "...", "purpose": "What this field is for", "suggested_value": null}
+  ],
+  "missing_required": ["field_id1", "field_id2"],
+  "navigable_actions": ["Submit", "Back", "Add Item"],
+  "explanation": "2-3 sentence natural language explanation for voice readout"
+}
+
+Be concise. Focus on what the user needs to do. Never output markdown.\
+"""
+
+
+def _parse_llm_json(raw: str) -> dict:
+    """Extract JSON from LLM output, tolerating markdown fences and stray text."""
+    raw   = raw.strip()
+    raw   = re.sub(r"```(?:json)?", "", raw).strip()
+    start = raw.find("{")
+    end   = raw.rfind("}")
+    if start == -1 or end == -1:
+        raise ValueError("No JSON object in LLM output")
+    return json.loads(raw[start:end+1])
+
+
+def _llm_explain(
+    context: dict,
+    user_instruction: str,
+    ollama_generate_fn: Callable,
+    all_fields: list[dict],
+    total: int,
+    filled: int,
+    missing: list[str],
+) -> PageInsight:
+    """Call the LLM for a full structured page explanation. Used as last resort."""
+    dom_summary = _slim_context_for_explain(context)
+    prompt = (
+        f"{_EXPLAIN_SYSTEM}\n\n"
+        f"INSTRUCTION FROM USER: {user_instruction[:200]}\n\n"
+        f"PAGE DOM SUMMARY:\n{dom_summary}"
+    )
+
+    page = context.get("page", {})
+    raw  = ollama_generate_fn(prompt)
+    data = _parse_llm_json(raw)
+
+    field_insights = []
+    for f in all_fields:
+        fid = f.get("field_id", "")
+        suggested = next(
+            (fi.get("suggested_value")
+             for fi in data.get("field_summary", [])
+             if fi.get("field_id") == fid),
+            None,
+        )
+        val = f.get("value")
+        field_insights.append(FieldInsight(
+            field_id=fid,
+            label=f.get("label", fid),
+            current_value=val,
+            is_required=f.get("required", False),
+            is_filled=bool(val and str(val).strip()),
+            is_readonly=f.get("readonly", False),
+            suggested_value=suggested,
+        ))
+
+    completion_pct = round(filled / total * 100, 1) if total else 0.0
+
+    return PageInsight(
+        page_title=page.get("title", "Unknown Page"),
+        page_url=page.get("page_id", ""),
+        page_purpose=data.get("page_purpose", "Unknown form purpose"),
+        total_fields=total,
+        filled_fields=filled,
+        required_missing=data.get("missing_required", missing),
+        field_insights=field_insights,
+        navigable_actions=data.get("navigable_actions", []),
+        completion_pct=completion_pct,
+        raw_explanation=data.get("explanation", f"I can see {total} fields, {filled} filled."),
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 5: PUBLIC API
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def explain_page(
+    context: dict,
+    user_instruction: str,
+    ollama_generate_fn: Callable,
+) -> PageInsight:
+    """
+    Explain the current page using the fastest available method.
+
+    Resolution order (each tier only runs if the previous returned nothing):
+      1. FieldDescriber — static ERP glossary  (~0ms)
+      2. DOM analyser   — structural DOM queries (~0ms)
+      3. LLM explain    — full structured analysis (~5-10s, last resort)
+
+    Args:
+        context:              Screen context dict from the extractor.
+        user_instruction:     What the user asked.
+        ollama_generate_fn:   generate() from ollama_client (for tier-3 fallback).
+
+    Returns:
+        PageInsight with structured field data and voice-ready explanation.
+    """
+    # Gather field stats (used by all tiers)
+    all_flds = _all_fields(context)
+    total    = len(all_flds)
+    filled   = sum(1 for f in all_flds if f.get("value") and str(f["value"]).strip())
+    req_ids  = [f["field_id"] for f in all_flds if f.get("required")]
+    missing  = [
+        fid for fid in req_ids
+        if not any(
+            f.get("value") and str(f["value"]).strip()
+            for f in all_flds if f.get("field_id") == fid
+        )
+    ]
+    page = context.get("page", {})
+    buttons = [
+        b.get("label", "") for b in context.get("buttons", []) if not b.get("disabled")
+    ]
+
+    # ── Tier 1: Static ERP glossary ──────────────────────────────────────
+    glossary_answer = field_describer.describe(user_instruction)
+    if glossary_answer:
+        logger.info("Page explain: glossary hit for '%s'", user_instruction[:60])
+        completion_pct = round(filled/total*100, 1) if total else 0.0
+        return PageInsight(
+            page_title=page.get("title", "Unknown Page"),
+            page_url=page.get("page_id", ""),
+            page_purpose=f"Answering: {user_instruction}",
+            total_fields=total,
+            filled_fields=filled,
+            required_missing=missing,
+            field_insights=[],
+            navigable_actions=buttons,
+            completion_pct=completion_pct,
+            raw_explanation=glossary_answer,
+        )
+
+    # ── Tier 2: DOM structural analysis ──────────────────────────────────
+    dom_answer = _try_dom_answer(user_instruction, context)
+    if dom_answer:
+        logger.info("Page explain: DOM analysis hit for '%s'", user_instruction[:60])
+        completion_pct = round(filled/total*100, 1) if total else 0.0
+        return PageInsight(
+            page_title=page.get("title", "Unknown Page"),
+            page_url=page.get("page_id", ""),
+            page_purpose=f"Answering: {user_instruction}",
+            total_fields=total,
+            filled_fields=filled,
+            required_missing=missing,
+            field_insights=[],
+            navigable_actions=buttons,
+            completion_pct=completion_pct,
+            raw_explanation=dom_answer,
+        )
+
+    # ── Tier 3: LLM fallback ──────────────────────────────────────────────
+    # Guard: if no LLM function was provided, build answer from DOM stats only
+    if ollama_generate_fn is None:
+        logger.info("Page explain: no LLM fn provided — building DOM-only answer")
+        completion_pct = round(filled/total*100, 1) if total else 0.0
+        all_names = [
+            re.sub(r"\([^)]*\)|[\u0900-\u0D7F]+|[*†]+","",f.get("label","")).strip()
+            for f in all_flds if not f.get("readonly") and not f.get("calculated")
+        ]
+        page = context.get("page", {})
+        ans  = f"I can see {total} fields on this page"
+        if filled:
+            ans += f", {filled} already filled"
+        if missing:
+            names = ", ".join(all_names[i] for i,f in enumerate(all_flds)
+                              if f.get("field_id") in missing)[:3]
+            ans  += f". Still needed: {names}"
+        ans += "."
+        return PageInsight(
+            page_title=page.get("title","Unknown"),
+            page_url=page.get("page_id",""),
+            page_purpose=user_instruction,
+            total_fields=total, filled_fields=filled, required_missing=missing,
+            field_insights=[], navigable_actions=buttons,
+            completion_pct=completion_pct, raw_explanation=ans,
+        )
+
+    logger.info("Page explain: LLM fallback for '%s'", user_instruction[:60])
+    try:
+        return _llm_explain(
+            context=context,
+            user_instruction=user_instruction,
+            ollama_generate_fn=ollama_generate_fn,
+            all_fields=all_flds,
+            total=total,
+            filled=filled,
+            missing=missing,
+        )
+    except Exception as exc:
+        logger.error("LLM explain failed: %s", exc)
+        # Final fallback — pure DOM stats, no LLM
+        completion_pct = round(filled/total*100, 1) if total else 0.0
+        return PageInsight(
+            page_title=page.get("title", "Unknown Page"),
+            page_url=page.get("page_id", ""),
+            page_purpose="Could not analyse page purpose",
+            total_fields=total,
+            filled_fields=filled,
+            required_missing=missing,
+            field_insights=[],
+            navigable_actions=buttons,
+            completion_pct=completion_pct,
+            raw_explanation=(
+                f"I can see {total} fields on this page, {filled} are filled. "
+                f"{len(missing)} required fields still need values."
+            ),
+        )

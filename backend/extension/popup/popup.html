@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Navix</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;500&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg: #0d0f12; --surface: #151820; --border: #252830;
+      --accent: #4fffb0; --accent2: #00bfff; --muted: #4a5060;
+      --text: #e8eaf0; --text-dim: #7a8090; --danger: #ff4d6a;
+      --warn: #ffb347; --radius: 10px;
+    }
+    body { width:320px; min-height:260px; background:var(--bg); color:var(--text);
+           font-family:'IBM Plex Sans',sans-serif; font-size:13px; overflow:hidden; }
+    header { display:flex; align-items:center; justify-content:space-between;
+             padding:12px 16px 10px; border-bottom:1px solid var(--border); }
+    .logo { display:flex; align-items:center; gap:7px; }
+    .logo-mark { width:22px; height:22px; background:var(--accent); border-radius:5px;
+                 display:flex; align-items:center; justify-content:center; }
+    .logo-mark svg { width:13px; height:13px; color:#0d0f12; }
+    .logo-text { font-family:'IBM Plex Mono',monospace; font-weight:600; font-size:14px;
+                 letter-spacing:-0.3px; color:var(--text); }
+    .logo-tag { font-size:9px; font-weight:400; color:var(--muted); letter-spacing:0.5px;
+                margin-left:3px; text-transform:uppercase; }
+    .toggle-wrap { display:flex; align-items:center; gap:8px; cursor:pointer; }
+    .toggle-label { font-family:'IBM Plex Mono',monospace; font-size:10px; letter-spacing:0.5px;
+                    color:var(--muted); text-transform:uppercase; transition:color 0.2s; }
+    .toggle-label.on { color:var(--accent); }
+    .toggle-switch { position:relative; width:36px; height:20px; }
+    .toggle-switch input { display:none; }
+    .toggle-slider { position:absolute; inset:0; background:var(--border); border-radius:20px;
+                     cursor:pointer; transition:background 0.2s; }
+    .toggle-slider::before { content:''; position:absolute; width:14px; height:14px; border-radius:50%;
+                              background:var(--muted); top:3px; left:3px;
+                              transition:transform 0.2s, background 0.2s; }
+    .toggle-switch input:checked + .toggle-slider { background:rgba(79,255,176,0.15); }
+    .toggle-switch input:checked + .toggle-slider::before { transform:translateX(16px); background:var(--accent); }
+    .voice-body { padding:20px 20px 16px; display:flex; flex-direction:column;
+                  align-items:center; gap:16px; }
+    .mic-ring { position:relative; width:80px; height:80px; }
+    .mic-ring-pulse { position:absolute; inset:-6px; border-radius:50%;
+                      border:2px solid transparent; transition:border-color 0.2s; }
+    .mic-ring-pulse.recording { border-color:var(--accent); animation:ring-pulse 1.2s ease-in-out infinite; }
+    @keyframes ring-pulse { 0%,100%{transform:scale(1);opacity:0.6} 50%{transform:scale(1.08);opacity:1} }
+    #mic-btn { width:80px; height:80px; border-radius:50%; border:none; background:var(--surface);
+               outline:2px solid var(--border); color:var(--text-dim); cursor:pointer;
+               display:flex; align-items:center; justify-content:center;
+               transition:color 0.2s,background 0.2s,outline-color 0.2s; position:relative; z-index:1; }
+    #mic-btn:hover { color:var(--text); outline-color:var(--muted); }
+    #mic-btn.recording { color:var(--accent); background:rgba(79,255,176,0.07); outline-color:var(--accent); }
+    #mic-btn.processing { color:var(--accent2); outline-color:var(--accent2); }
+    #mic-btn svg { pointer-events:none; }
+    .mic-label { font-family:'IBM Plex Mono',monospace; font-size:10px; letter-spacing:0.5px;
+                 color:var(--muted); text-transform:uppercase; text-align:center; transition:color 0.2s; }
+    .mic-label.recording { color:var(--accent); }
+    .mic-label.processing { color:var(--accent2); }
+    #voice-waveform { display:flex; gap:3px; align-items:flex-end; height:20px;
+                      opacity:0; transition:opacity 0.2s; }
+    #voice-waveform.active { opacity:1; }
+    #voice-waveform span { display:block; width:3px; background:var(--accent);
+                           border-radius:2px; min-height:3px; }
+    #voice-waveform.active span { animation:wave 0.8s ease-in-out infinite; }
+    #voice-waveform span:nth-child(1){animation-delay:0.0s}
+    #voice-waveform span:nth-child(2){animation-delay:0.1s}
+    #voice-waveform span:nth-child(3){animation-delay:0.2s}
+    #voice-waveform span:nth-child(4){animation-delay:0.3s}
+    #voice-waveform span:nth-child(5){animation-delay:0.4s}
+    #voice-waveform span:nth-child(6){animation-delay:0.3s}
+    #voice-waveform span:nth-child(7){animation-delay:0.2s}
+    #voice-waveform span:nth-child(8){animation-delay:0.1s}
+    @keyframes wave { 0%,100%{height:3px} 50%{height:16px} }
+    .response-area { width:100%; display:flex; flex-direction:column; gap:6px; }
+    .transcript-row { display:flex; align-items:flex-start; gap:8px; background:var(--surface);
+                      border:1px solid var(--border); border-radius:var(--radius); padding:8px 10px;
+                      opacity:0; transform:translateY(4px); transition:opacity 0.2s,transform 0.2s; }
+    .transcript-row.visible { opacity:1; transform:none; }
+    .row-tag { font-family:'IBM Plex Mono',monospace; font-size:9px; letter-spacing:0.5px;
+               text-transform:uppercase; color:var(--muted); padding-top:2px; flex-shrink:0; min-width:28px; }
+    .row-text { font-size:12px; line-height:1.5; color:var(--text); flex:1; }
+    .response-row .row-text { color:var(--accent); }
+    .action-chip { display:inline-flex; align-items:center; gap:4px;
+                   background:rgba(79,255,176,0.08); border:1px solid rgba(79,255,176,0.2);
+                   border-radius:5px; padding:2px 7px; font-family:'IBM Plex Mono',monospace;
+                   font-size:10px; color:var(--accent); margin-top:4px; width:fit-content; }
+    .action-chip.action-explain  { background:rgba(0,191,255,0.08); border-color:rgba(0,191,255,0.2); color:var(--accent2); }
+    .action-chip.action-error    { background:rgba(255,77,106,0.08); border-color:rgba(255,77,106,0.2); color:var(--danger); }
+    .action-chip.action-navigate { background:rgba(255,179,71,0.08); border-color:rgba(255,179,71,0.2); color:var(--warn); }
+    .replay-btn { background:none; border:none; color:var(--muted); cursor:pointer;
+                  padding:2px 4px; border-radius:4px; font-size:11px; transition:color 0.15s; flex-shrink:0; }
+    .replay-btn:hover { color:var(--text); }
+    .warning-row { display:flex; align-items:flex-start; gap:6px; background:rgba(255,179,71,0.06);
+                   border:1px solid rgba(255,179,71,0.2); border-radius:var(--radius);
+                   padding:7px 10px; font-size:11px; color:var(--warn); line-height:1.4; }
+    .error-row { display:flex; align-items:flex-start; gap:6px; background:rgba(255,77,106,0.06);
+                 border:1px solid rgba(255,77,106,0.2); border-radius:var(--radius);
+                 padding:7px 10px; font-size:11px; color:var(--danger); line-height:1.4; }
+    .hidden { display:none !important; }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <header>
+      <div class="logo">
+        <div class="logo-mark">
+          <svg viewBox="0 0 13 13" fill="none"><path d="M6.5 1L9.5 4H10.5C11.05 4 11.5 4.45 11.5 5V8C11.5 8.55 11.05 9 10.5 9H9.5L6.5 12L3.5 9H2.5C1.95 9 1.5 8.55 1.5 8V5C1.5 4.45 1.95 4 2.5 4H3.5L6.5 1Z" fill="currentColor"/></svg>
+        </div>
+        <span class="logo-text">GoPilot<span class="logo-tag">voice</span></span>
+      </div>
+      <label class="toggle-wrap" title="Enable/disable CoPilot">
+        <span class="toggle-label" id="toggle-label">OFF</span>
+        <div class="toggle-switch">
+          <input type="checkbox" id="copilot-toggle" />
+          <div class="toggle-slider"></div>
+        </div>
+      </label>
+    </header>
+
+    <div class="voice-body">
+      <div class="mic-ring">
+        <div class="mic-ring-pulse" id="mic-ring-pulse"></div>
+        <button id="mic-btn" title="Tap to speak">
+          <svg id="mic-icon" width="28" height="28" viewBox="0 0 24 24" fill="none">
+            <rect x="9" y="2" width="6" height="12" rx="3" fill="currentColor"/>
+            <path d="M5 11a7 7 0 0 0 14 0" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" fill="none"/>
+            <line x1="12" y1="18" x2="12" y2="22" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+            <line x1="9" y1="22" x2="15" y2="22" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+          </svg>
+          <svg id="stop-icon" class="hidden" width="28" height="28" viewBox="0 0 24 24" fill="none">
+            <rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor"/>
+          </svg>
+          <svg id="spin-icon" class="hidden" width="28" height="28" viewBox="0 0 24 24" fill="none">
+            <circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="2" stroke-dasharray="28 56" stroke-linecap="round"/>
+          </svg>
+        </button>
+      </div>
+
+      <div style="display:flex;flex-direction:column;align-items:center;gap:8px;margin-top:-6px;">
+        <div id="mic-label" class="mic-label">Tap to speak</div>
+        <div id="voice-waveform">
+          <span></span><span></span><span></span><span></span>
+          <span></span><span></span><span></span><span></span>
+        </div>
+      </div>
+
+      <div class="response-area" id="response-area">
+        <div class="transcript-row" id="transcript-row">
+          <span class="row-tag">you</span>
+          <span class="row-text" id="transcript-text"></span>
+        </div>
+        <div class="transcript-row response-row" id="response-row">
+          <span class="row-tag">ai</span>
+          <div style="flex:1;display:flex;flex-direction:column;gap:4px;">
+            <span class="row-text" id="response-text"></span>
+            <span id="action-chip" class="action-chip hidden"></span>
+          </div>
+          <button id="replay-btn" class="replay-btn hidden" title="Replay">▶</button>
+        </div>
+        <div class="warning-row hidden" id="warning-row">
+          <span>⚠</span><span id="warning-text"></span>
+        </div>
+        <div class="error-row hidden" id="error-row">
+          <span>✕</span><span id="error-text"></span>
+        </div>
+      </div>
+    </div>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>

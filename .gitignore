@@ -1,0 +1,13 @@
+# Ignore everything
+/*
+
+# Except the backend folder and this ignore file
+!/backend/
+!.gitignore
+
+# Inside backend, still ignore the junk
+backend/**/__pycache__/
+backend/**/*.pyc
+backend/logs/
+backend/voice_output/
+backend/.env

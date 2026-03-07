@@ -1,0 +1,15 @@
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+pydantic==2.7.1
+pydantic-settings==2.2.1
+requests==2.32.3
+python-multipart==0.0.9
+# STT — OpenAI Whisper (no HuggingFace account required, supports all Indian languages)
+openai-whisper==20231117
+torch>=2.1.0
+torchaudio>=2.1.0
+# TTS — Indic Parler-TTS (install separately: pip install git+https://github.com/ai4bharat/indic-parler-tts)
+soundfile>=0.12.1
+simpleaudio==1.0.4
+# transformers still needed for TTS model
+transformers>=4.40.0
