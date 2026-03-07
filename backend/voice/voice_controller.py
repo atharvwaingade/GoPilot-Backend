@@ -992,6 +992,59 @@ class VoiceController:
             guided_fill_active=guided_fill_manager.is_in_guided_session(session_id),
         )
 
+    # ── Public: process one text turn (skips STT) ────────────────────────────
+
+    def process_text(
+        self,
+        text:          str,
+        workflow_name: str,
+        screen_context: dict,
+        session_id:    str,
+        ai_step_fn,
+        play_audio:    bool = False,
+    ) -> "VoiceResult":
+        """
+        Run one complete turn with a pre-supplied text instruction (no STT).
+
+        Identical to process() but skips step 1 (speech-to-text) so the
+        popup text input, Tauri app, and /voice/text REST endpoint can all
+        participate in the same pipeline without needing audio.
+        """
+        # Inject the text as the raw transcription and delegate to process()
+        # We synthesise a trivially small silent WAV so process() works unchanged.
+        import struct, time as _time
+
+        # 10-ms silent 16kHz mono WAV  (44 byte header + 160 samples)
+        num_samples = 160
+        header = struct.pack(
+            "<4sI4s4sIHHIIHH4sI",
+            b"RIFF", 36 + num_samples * 2, b"WAVE",
+            b"fmt ", 16, 1, 1, 16000, 32000, 2, 16,
+            b"data", num_samples * 2,
+        )
+        silent_wav = header + b"\x00" * (num_samples * 2)
+
+        # Temporarily monkey-patch the STT engine so it returns our text
+        # rather than transcribing silence.  Thread-safe because each request
+        # calls process_text() on the same controller instance sequentially.
+        _orig_transcribe = self._stt.transcribe_bytes
+        self._stt.transcribe_bytes = lambda _b, suffix=".wav": text
+
+        try:
+            result = self.process(
+                audio_bytes=silent_wav,
+                workflow_name=workflow_name,
+                screen_context=screen_context,
+                session_id=session_id,
+                ai_step_fn=ai_step_fn,
+                play_audio=play_audio,
+                audio_suffix=".wav",
+            )
+        finally:
+            self._stt.transcribe_bytes = _orig_transcribe
+
+        return result
+
     # ── Public: proactive page announcement ───────────────────────────────────
 
     def announce_page(

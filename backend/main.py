@@ -611,6 +611,101 @@ def voice_audio(filename: str) -> FileResponse:
     )
 
 
+# ── Text command endpoint ─────────────────────────────────────────────────────
+class VoiceTextRequest(BaseModel):
+    text:           str
+    workflow:       str  = "free"
+    session_id:     str  = ""
+    screen_context: dict = {}
+
+
+@app.post("/voice/text", response_model=VoiceResponse, tags=["voice"])
+def voice_text(body: VoiceTextRequest) -> VoiceResponse:
+    """
+    Text command pipeline: Text → AI step → TTS → WAV.
+
+    Identical to /voice/process but skips STT — accepts typed text directly.
+    Used by the popup text input and any API consumer that already has text.
+
+    Send as JSON:
+      text           = the user's instruction (e.g. "Set category to chairs")
+      workflow       = purchase | supplier | sell | free
+      session_id     = string
+      screen_context = current page DOM context dict
+    """
+    if not body.text or not body.text.strip():
+        raise HTTPException(status_code=400, detail="text is required")
+
+    import time as _time_mod
+    session_id = body.session_id or f"text-{int(_time_mod.time())}"
+
+    from workflow_core.registry import workflow_registry
+    from reasoning_layer.controller import ReasoningController
+    from model_manager.mode_selector import select_mode
+    from voice.voice_controller import get_voice_controller
+
+    try:
+        workflow_registry.get(body.workflow)
+    except KeyError:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Workflow '{body.workflow}' not found.",
+        )
+
+    hw   = engine.hardware
+    mode = select_mode(hw)
+    rc   = ReasoningController(mode=mode)
+
+    def ai_step_fn(workflow: str, screen_context: dict, instruction: str, session_id: str) -> dict:
+        _wf             = workflow_registry.get_best(workflow, screen_context)
+        wf_result       = _wf.next_step(screen_context)
+        missing_required = [
+            f["field_id"]
+            for section in screen_context.get("sections", [])
+            for f in section.get("fields", [])
+            if f.get("field_id") in _wf.required_fields
+            and not (f.get("value") or "")
+        ]
+        action = rc.run(
+            workflow_name=workflow,
+            screen_context=screen_context,
+            user_instruction=instruction,
+            next_field=wf_result.next_field,
+            calculated_fields=_wf.calculated_fields,
+            required_fields=_wf.required_fields,
+            missing_required=missing_required,
+        )
+        return action if isinstance(action, dict) else action.model_dump()
+
+    try:
+        controller = get_voice_controller()
+        result = controller.process_text(
+            text=body.text.strip(),
+            workflow_name=body.workflow,
+            screen_context=body.screen_context,
+            session_id=session_id,
+            ai_step_fn=ai_step_fn,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    return VoiceResponse(
+        transcription          = result.transcription,
+        normalised             = result.normalised,
+        ai_response            = result.spoken_response,
+        audio_file             = result.audio_file,
+        action                 = result.ai_action,
+        nav_action             = getattr(result, "nav_action", False),
+        multi_fill_active      = getattr(result, "multi_fill_active", False),
+        detail_mode            = result.detail_mode,
+        submit_guard_triggered = result.submit_guard_triggered,
+        guided_fill_active     = result.guided_fill_active,
+        warning                = result.warning,
+    )
+
+
 class StreamRequest(BaseModel):
     text:       str
     session_id: str = ""
