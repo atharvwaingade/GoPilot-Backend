@@ -408,8 +408,8 @@ def _apply_submit_guard(
                             w.spoken for w in
                             _rv.validate_before_submit(screen_context)
                         ]
-                    except Exception:
-                        pass
+                    except Exception as _rv_err:
+                        logger.debug("realtime_validator failed: %s", _rv_err)
                 if pre_warnings:
                     return action, " ".join(pre_warnings) + " Please fix these before submitting."
 
@@ -865,8 +865,8 @@ class VoiceController:
                 if not _pending_hint:
                     n = len(llm_batch)
                     _pending_hint = f" I'll fill {n} more {'field' if n==1 else 'fields'} after this."
-        except Exception:
-            pass
+        except Exception as _batch_err:
+            logger.debug("LLM batch queue enrichment failed: %s", _batch_err)
 
         # Enrich tool_call with label+type from DOM for better speech
         if action.get("action") == "tool_call" and not action.get("label"):

@@ -5,13 +5,25 @@ Target: <1s total including network round-trip.
 Model: qwen2.5:3b @ 100% GPU = ~600-800ms inference on RTX 3050 6GB.
 """
 import logging
+import os
 import threading
 import requests
 
 logger = logging.getLogger(__name__)
 
-OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
-MODEL           = "qwen2.5:3b"
+# Allow overriding the Ollama server URL and model via environment variables
+# or via config.py Pydantic settings (COPILOT_OLLAMA_URL / COPILOT_OLLAMA_MODEL).
+# Falls back to the hard-coded defaults so existing deployments are unaffected.
+try:
+    from config import settings as _settings
+    _OLLAMA_BASE_URL = _settings.ollama_url.rstrip("/")
+    MODEL            = _settings.ollama_model
+except Exception:
+    _OLLAMA_BASE_URL = os.environ.get("COPILOT_OLLAMA_URL", "http://localhost:11434").rstrip("/")
+    MODEL            = os.environ.get("COPILOT_OLLAMA_MODEL", "qwen2.5:3b")
+
+OLLAMA_CHAT_URL = f"{_OLLAMA_BASE_URL}/api/chat"
+
 NUM_CTX         = 2048
 NUM_PREDICT     = 300   # single action ~80 tokens; multi-fill array ~200 tokens
 TEMPERATURE     = 0.0

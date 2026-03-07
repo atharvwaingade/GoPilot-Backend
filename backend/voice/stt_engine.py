@@ -11,6 +11,11 @@ Language handling:
   - Default: auto-detect (handles Hindi, English, Hinglish/code-switching)
   - Override per-call or via COPILOT_STT_LANG env var
   - Setting to "auto" or "" -> Whisper detects language from audio content
+
+Performance:
+  - fp16 is enabled automatically when CUDA is available (RTX 3050 / any Nvidia GPU)
+    giving ~2× faster transcription with no accuracy loss.
+  - Set COPILOT_STT_FP16=false to force fp16 off (e.g. on CPU-only hosts).
 """
 from __future__ import annotations
 
@@ -24,6 +29,23 @@ logger = logging.getLogger(__name__)
 # -- Configuration -------------------------------------------------------------
 STT_LANG      = os.environ.get("COPILOT_STT_LANG", "auto")
 WHISPER_MODEL = os.environ.get("COPILOT_WHISPER_MODEL", "small")
+
+# fp16 speeds up Whisper ~2× on CUDA GPUs (RTX 3050, etc.).
+# Auto-detect CUDA; override with COPILOT_STT_FP16=true|false.
+def _resolve_fp16() -> bool:
+    env_val = os.environ.get("COPILOT_STT_FP16", "").lower()
+    if env_val in ("true", "1", "yes"):
+        return True
+    if env_val in ("false", "0", "no"):
+        return False
+    # Auto-detect: use fp16 only when a CUDA GPU is available
+    try:
+        import torch
+        return torch.cuda.is_available()
+    except Exception:
+        return False
+
+_USE_FP16 = _resolve_fp16()
 
 # Safe temp dir with no spaces in path
 _SAFE_TMP_DIR = Path(__file__).parent.parent / "voice_output" / "tmp"
@@ -39,9 +61,9 @@ def _load_model():
         return _model
     try:
         import whisper
-        logger.info("Loading Whisper '%s' model...", WHISPER_MODEL)
+        logger.info("Loading Whisper '%s' model (fp16=%s)...", WHISPER_MODEL, _USE_FP16)
         _model = whisper.load_model(WHISPER_MODEL)
-        logger.info("Whisper '%s' loaded successfully", WHISPER_MODEL)
+        logger.info("Whisper '%s' loaded successfully (fp16=%s)", WHISPER_MODEL, _USE_FP16)
         return _model
     except ImportError as exc:
         raise RuntimeError(
@@ -173,7 +195,7 @@ class STTEngine:
             result = model.transcribe(
                 audio_input,
                 language=resolved_lang,
-                fp16=False,         # CPU compatibility
+                fp16=_USE_FP16,     # True on CUDA GPUs (~2× faster); False on CPU
                 task="transcribe",  # preserves original language
             )
         except Exception as exc:

@@ -569,8 +569,8 @@ def voice_process(
         try:
             from voice.page_memory import page_memory_store
             page_memory_store.log_instruction(_tab_sid, result.transcription)
-        except Exception:
-            pass
+        except Exception as _pm_err:
+            logger.debug("page_memory log_instruction failed: %s", _pm_err)
 
     return VoiceResponse(
         transcription          = result.transcription,

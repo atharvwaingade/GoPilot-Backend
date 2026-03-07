@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+import threading
 from typing import Any
 
 from pydantic import ValidationError
@@ -13,13 +14,16 @@ logger = logging.getLogger(__name__)
 
 # Module-level queue for multi-fill batches from LLM array responses.
 # voice_controller drains this after processing the first action.
+# Protected by a lock so concurrent requests don't corrupt each other's batches.
+_llm_batch_lock:  threading.Lock = threading.Lock()
 _llm_batch_queue: list[dict] = []
 
 
 def pop_llm_batch() -> list[dict]:
     """Drain and return any pending batch fills from the last LLM array response."""
-    batch = list(_llm_batch_queue)
-    _llm_batch_queue.clear()
+    with _llm_batch_lock:
+        batch = list(_llm_batch_queue)
+        _llm_batch_queue.clear()
     return batch
 
 _JSON_GREEDY_RE    = re.compile(r"\{.*\}",  re.DOTALL)
@@ -223,16 +227,18 @@ def parse_llm_output(raw: str, calculated_fields: list[str], readonly_fields: li
                             if act.field_id in calculated_fields or act.field_id in readonly_fields:
                                 continue
                         valid_actions.append(act)
-                    except Exception:
+                    except Exception as _ve:
+                        logger.debug("Array element validation failed: %s", _ve)
                         continue
                 if valid_actions:
                     logger.info("LLM returned %d-fill array", len(valid_actions))
                     # Store batch in module-level queue — voice_controller drains it
                     if len(valid_actions) > 1:
-                        _llm_batch_queue.clear()
-                        _llm_batch_queue.extend(
-                            a.model_dump() for a in valid_actions[1:]
-                        )
+                        with _llm_batch_lock:
+                            _llm_batch_queue.clear()
+                            _llm_batch_queue.extend(
+                                a.model_dump() for a in valid_actions[1:]
+                            )
                     return valid_actions[0]
         except (json.JSONDecodeError, Exception) as exc:
             logger.warning("Array parse failed: %s", exc)

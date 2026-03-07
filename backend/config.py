@@ -20,6 +20,16 @@ class Settings(BaseSettings):
         description="Directory for JSONL audit session logs, relative to the backend root",
     )
 
+    # Ollama / LLM settings
+    ollama_url: str = Field(
+        default="http://localhost:11434",
+        description="Base URL for the Ollama server (e.g. http://localhost:11434)",
+    )
+    ollama_model: str = Field(
+        default="qwen2.5:3b",
+        description="Ollama model name used for LLM reasoning (e.g. qwen2.5:3b)",
+    )
+
     model_config = {
         "env_prefix": "COPILOT_",
         "env_file": ".env",

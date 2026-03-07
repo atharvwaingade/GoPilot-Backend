@@ -165,8 +165,8 @@ def nav_readback(
     try:
         spoken = build_page_announcement(context=context, url=url, enabled=False)
         return spoken
-    except Exception:
-        pass
+    except Exception as _ann_err:
+        logger.debug("build_page_announcement failed: %s", _ann_err)
 
     # Minimal fallback
     page = context.get("page", {})

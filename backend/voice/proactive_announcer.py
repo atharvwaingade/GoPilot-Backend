@@ -208,8 +208,8 @@ def build_page_announcement(
                 spoken += " Say 'how many pending' or 'show me last 5' to hear details."
                 parts.append(spoken)
                 return " ".join(p for p in parts if p)
-        except Exception:
-            pass
+        except Exception as _tbl_err:
+            logger.debug("table_reader failed in proactive_announcer: %s", _tbl_err)
 
         buttons = context.get("buttons", [])
         nav_count = sum(1 for b in buttons if b.get("is_nav"))
