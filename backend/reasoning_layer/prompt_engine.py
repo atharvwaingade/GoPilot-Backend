@@ -112,41 +112,46 @@ def build_planning_prompt(
         # Keep only first 20 entries
         map_json = json.dumps(dict(list(label_map.items())[:20]), separators=(",", ":"))
 
-    lines = [f"FIELDS:{map_json}"]
-
-    # Give model a concrete expected output when we have a best match
+    # Use "MAP" instead of "FIELDS" to avoid the model treating "fields" as a field_id.
+    # Give an explicit target when we have a confident best match + value.
     if best_fid and value:
-        lines.append(
-            f"HINT: field_id for this request is likely \"{best_fid}\""
+        expected = json.dumps(
+            {"action": "tool_call", "field_id": best_fid, "value": value, "reason": ""},
+            separators=(",", ":"),
         )
-        lines.append(
-            f"EXPECTED:{json.dumps({'action':'tool_call','field_id':best_fid,'value':value,'reason':'user instruction'}, separators=(',',':'))}"
+        prompt = (
+            f"MAP:{map_json}\n"
+            f"CMD:{user_instruction.strip()}\n"
+            f"OUT:{expected}"
         )
-
-    lines.append(f"TASK:{user_instruction.strip()}")
-    lines.append("JSON:")
-    return "\n".join(lines)
+    else:
+        prompt = (
+            f"MAP:{map_json}\n"
+            f"CMD:{user_instruction.strip()}\n"
+            f"OUT:"
+        )
+    return prompt
 
 
 def build_retry_prompt(original: str, bad_output: str, error: str) -> str:
-    # Extract fields and task from original
-    fields_match = re.search(r"FIELDS:(\{.+?\})", original, re.DOTALL)
-    task_match   = re.search(r"TASK:(.+?)(?:\n|$)", original)
-    hint_match   = re.search(r"EXPECTED:(.+?)(?:\n|$)", original)
+    # Extract map and cmd from original
+    map_match = re.search(r"MAP:(\{.+?\})", original, re.DOTALL)
+    cmd_match  = re.search(r"CMD:(.+?)(?:\n|$)", original)
+    out_match  = re.search(r"OUT:(.+?)(?:\n|$)", original)
 
-    fields = fields_match.group(1) if fields_match else "{}"
-    task   = task_match.group(1).strip() if task_match else ""
-    hint   = hint_match.group(1).strip() if hint_match else ""
+    field_map = map_match.group(1) if map_match else "{}"
+    cmd       = cmd_match.group(1).strip() if cmd_match else ""
+    hint      = out_match.group(1).strip() if out_match else ""
 
     lines = [
-        f"FIELDS:{fields}",
-        f"TASK:{task}",
+        f"MAP:{field_map}",
+        f"CMD:{cmd}",
         f"WRONG:{bad_output[:80]}",
         f"ERROR:{error[:100]}",
     ]
-    if hint:
-        lines.append(f"CORRECT OUTPUT IS:{hint}")
-    lines.append("JSON:")
+    if hint and hint != "":
+        lines.append(f"CORRECT:{hint}")
+    lines.append("OUT:")
     return "\n".join(lines)
 
 

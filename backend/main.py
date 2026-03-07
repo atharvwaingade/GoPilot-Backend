@@ -48,7 +48,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     threading.Thread(target=_prewarm, daemon=True).start()
 
     # ── Wire up CoPilot Vision Loop ──────────────────────────────────────────
-    from reasoning_layer.controller import ReasoningController
+    from reasoning_layer.controller import ReasoningController, get_controller
     from security.permissions import tool_permission_guard
     from logs.audit_logger import audit_logger
     from model_manager.mode_selector import select_mode
@@ -57,7 +57,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     hw   = engine.hardware
     mode = select_mode(hw)
-    rc   = ReasoningController(mode=mode)
+    rc   = get_controller(mode)
 
     def _reasoning_fn(workflow, screen_context, instruction, session_id):
         from workflow_core.registry import workflow_registry
@@ -190,7 +190,7 @@ async def disable_plugin(plugin_name: str) -> dict:
 # ── AI Workflow Step ───────────────────────────────────────────────────────
 
 from workflow_core.registry import workflow_registry
-from reasoning_layer.controller import ReasoningController
+from reasoning_layer.controller import ReasoningController, get_controller
 from reasoning_layer.schemas import LLMAction, ErrorAction
 from model_manager.mode_selector import select_mode
 
@@ -231,7 +231,7 @@ async def workflow_ai_step(workflow_name: str, body: AIStepRequest) -> dict:
 
     hw = engine.hardware
     mode = select_mode(hw)
-    controller = ReasoningController(mode=mode)
+    controller = get_controller(mode)
 
     action = controller.run(
         workflow_name=workflow_name,
@@ -353,7 +353,7 @@ async def list_audit_sessions() -> dict:
 # ── Autonomous execution ───────────────────────────────────────────────────
 
 from core.executor import AutonomousExecutor, StopReason
-from reasoning_layer.controller import ReasoningController
+from reasoning_layer.controller import ReasoningController, get_controller
 from security.permissions import tool_permission_guard
 from logs.audit_logger import audit_logger
 
@@ -408,7 +408,7 @@ def workflow_autorun(workflow_name: str, body: AutoRunRequest) -> AutoRunRespons
 
     hw         = engine.hardware
     mode       = select_mode(hw)
-    controller = ReasoningController(mode=mode)
+    controller = get_controller(mode)
 
     executor = AutonomousExecutor(
         reasoning_controller=controller,
@@ -518,12 +518,12 @@ def voice_process(
         )
 
     # Build the AI step callable for the voice controller
-    from reasoning_layer.controller import ReasoningController
+    from reasoning_layer.controller import get_controller
     from model_manager.mode_selector import select_mode
 
     hw   = engine.hardware
     mode = select_mode(hw)
-    rc   = ReasoningController(mode=mode)
+    rc   = get_controller(mode)
 
     def ai_step_fn(workflow: str, screen_context: dict, instruction: str, session_id: str) -> dict:
         _wf             = workflow_registry.get_best(workflow, screen_context)
@@ -640,7 +640,7 @@ def voice_text(body: VoiceTextRequest) -> VoiceResponse:
     session_id = body.session_id or f"text-{int(_time_mod.time())}"
 
     from workflow_core.registry import workflow_registry
-    from reasoning_layer.controller import ReasoningController
+    from reasoning_layer.controller import get_controller
     from model_manager.mode_selector import select_mode
     from voice.voice_controller import get_voice_controller
 
@@ -654,7 +654,7 @@ def voice_text(body: VoiceTextRequest) -> VoiceResponse:
 
     hw   = engine.hardware
     mode = select_mode(hw)
-    rc   = ReasoningController(mode=mode)
+    rc   = get_controller(mode)
 
     def ai_step_fn(workflow: str, screen_context: dict, instruction: str, session_id: str) -> dict:
         _wf             = workflow_registry.get_best(workflow, screen_context)

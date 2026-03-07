@@ -200,6 +200,19 @@ def _sanitise(data: dict, action_type: ActionType) -> dict:
 
 
 def parse_llm_output(raw: str, calculated_fields: list[str], readonly_fields: list[str]) -> LLMAction:
+    # ── Pre-validation: reject obviously hallucinated output ─────────────────
+    # When the model echoes back the prompt (e.g. outputs {"field_id":"fields","value":"MAP:..."})
+    # the value contains JSON-like content.  Reject immediately.
+    _PROMPT_ECHO_RE = re.compile(
+        r"""(?x)
+        ^\s*(?:MAP:|CMD:|OUT:|FIELDS:|TASK:|JSON:)   # prompt prefix echoed as value
+        | \{["\s]*action["\s]*:                       # raw action JSON inside value
+        | [{}]{2,}                                    # }{} artifact
+        """, re.IGNORECASE
+    )
+    _RESERVED_FIELD_IDS = {"fields", "field_map", "map", "fieldmap", "fields_map",
+                           "task", "json", "out", "cmd", "instruction"}
+
     # ── Handle JSON array (multi-fill response) ────────────────────────────
     # The upgraded system prompt can return an array of tool_calls.
     # We return the FIRST one here; the rest are handled by the multi-fill
@@ -287,6 +300,17 @@ def parse_llm_output(raw: str, calculated_fields: list[str], readonly_fields: li
             return ErrorAction(reason=f"'{action.field_id}' is calculated", raw_output=raw[:500])
         if action.field_id in readonly_fields:
             return ErrorAction(reason=f"'{action.field_id}' is readonly", raw_output=raw[:500])
+        # Reject prompt-echo hallucinations
+        if action.field_id.lower() in _RESERVED_FIELD_IDS:
+            return ErrorAction(
+                reason=f"Hallucinated field_id '{action.field_id}' (reserved name)",
+                raw_output=raw[:500],
+            )
+        if action.value and _PROMPT_ECHO_RE.search(str(action.value)):
+            return ErrorAction(
+                reason=f"Hallucinated value — prompt echo: {str(action.value)[:80]}",
+                raw_output=raw[:500],
+            )
 
     logger.debug("Validated: %s field_id=%s", action_type.value,
                  getattr(action, 'field_id', '-'))

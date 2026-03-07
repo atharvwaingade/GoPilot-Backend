@@ -31,10 +31,14 @@ TIMEOUT         = 10
 
 SYSTEM = (
     "You output ONLY a single JSON object. No text before or after.\n"
-    "For fill/set/enter tasks use this exact format:\n"
-    '{"action":"tool_call","field_id":"<id from FIELDS>","value":"<value>","reason":""}\n'
-    "The action field must be exactly one of: tool_call, explain, confirmation, error.\n"
-    "field_id must be copied exactly from the FIELDS map provided."
+    "You will receive:\n"
+    "  MAP: a label→field_id dictionary\n"
+    "  CMD: the user instruction\n"
+    "  OUT: (optional) the expected JSON — output it as-is if provided\n"
+    "For fill/set/enter tasks output EXACTLY:\n"
+    '{"action":"tool_call","field_id":"<id from MAP>","value":"<value>","reason":""}\n'
+    "The field_id MUST be copied exactly from the MAP values (right side), not the keys.\n"
+    "Action must be one of: tool_call, explain, confirmation, error."
 )
 
 _lock    = threading.Lock()
@@ -52,7 +56,7 @@ def _get_session() -> requests.Session:
                     "model": MODEL,
                     "messages": [
                         {"role": "system", "content": SYSTEM},
-                        {"role": "user",   "content": 'FIELDS:{"name":"name"}\nTASK:fill name as test\nJSON:'},
+                        {"role": "user",   "content": 'MAP:{"name":"name"}\nCMD:fill name as test\nOUT:{"action":"tool_call","field_id":"name","value":"test","reason":""}'},
                     ],
                     "stream": False, "format": "json",
                     "options": {"num_predict": 20, "num_ctx": NUM_CTX},
