@@ -544,7 +544,8 @@ def voice_process(
             required_fields=_wf.required_fields,
             missing_required=missing_required,
         )
-        return action.model_dump()
+        # run() can return a plain dict (multi_fill path) or a Pydantic model
+        return action if isinstance(action, dict) else action.model_dump()
 
     # Run voice pipeline
     try:

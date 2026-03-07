@@ -868,13 +868,25 @@ class VoiceController:
         except Exception as _batch_err:
             logger.debug("LLM batch queue enrichment failed: %s", _batch_err)
 
-        # Enrich tool_call with label+type from DOM for better speech
-        if action.get("action") == "tool_call" and not action.get("label"):
+        # Enrich tool_call with label, type, dom_id, and placeholder from DOM.
+        # dom_id and placeholder are forwarded to executor.js as fallback lookup
+        # keys so the element can be found even after a React re-render wipes
+        # the data-copilot-field-id stamp.
+        if action.get("action") == "tool_call":
             fid = action.get("field_id","")
             for section in screen_context.get("sections",[]):
                 for f in section.get("fields",[]):
                     if f.get("field_id") == fid:
-                        action = {**action, "label": f.get("label",""), "type": f.get("type","text")}
+                        extras: dict = {}
+                        if not action.get("label"):
+                            extras["label"] = f.get("label","")
+                            extras["type"]  = f.get("type","text")
+                        if not action.get("dom_id") and f.get("dom_id"):
+                            extras["dom_id"] = f.get("dom_id")
+                        if not action.get("placeholder") and f.get("placeholder"):
+                            extras["placeholder"] = f.get("placeholder")
+                        if extras:
+                            action = {**action, **extras}
                         break
 
         # ── 6b. Semantic field classification (Stage 3.1) ─────────────────
