@@ -1,5 +1,49 @@
 "use strict";
 
+// ── Missing-variable declarations ─────────────────────────────────────────
+// These were used throughout popup.js but never declared, causing runtime
+// ReferenceErrors visible in the extension Errors panel.
+
+// Tracks which tab IDs have already had scripts injected (avoids re-injection).
+const _injectedTabs = new Set();
+
+// Cache for tool-permission check results (avoids redundant network calls).
+const _permCache = new Map();
+
+// Timer handle for guided-mode auto-reopen of the microphone.
+let _guidedMicTimer = null;
+
+// Lightweight performance timing helpers (no-op when not needed).
+const _tTimers = {};
+function tStart(label) { _tTimers[label] = performance.now(); }
+function tEnd(label) {
+  if (_tTimers[label] != null) {
+    console.log(`[GoPilot ⏱] ${label}: ${(performance.now() - _tTimers[label]).toFixed(1)}ms`);
+    delete _tTimers[label];
+  }
+}
+
+/**
+ * resolveToolName — maps a field_id to the tool permission name used by the
+ * backend /tools/check endpoint.  Field IDs use snake_case; the backend
+ * currently accepts them as-is.  The function is kept as a thin normaliser
+ * so future remapping rules only need to be changed here.
+ *
+ * @param {string} fieldId  e.g. "product_category_2"
+ * @returns {string}        e.g. "fill_field"
+ */
+function resolveToolName(fieldId) {
+  if (!fieldId) return "fill_field";
+  // Specific high-risk fields get dedicated permission names so admins can
+  // block them individually.  Everything else falls back to "fill_field".
+  const HIGH_RISK_PREFIXES = ["invoice", "total", "amount", "discount", "tax", "payment"];
+  const lower = String(fieldId).toLowerCase();
+  for (const prefix of HIGH_RISK_PREFIXES) {
+    if (lower.startsWith(prefix)) return `fill_${prefix}_field`;
+  }
+  return "fill_field";
+}
+
 // ── Tab-stable session ID ─────────────────────────────────────────────────
 let _tabSessionId = null;
 
@@ -118,56 +162,58 @@ async function playAudio(url, priority = "normal") {
 // ── UI state ──────────────────────────────────────────────────────────────
 function setVoiceState(state) {
   // states: idle | recording | processing | done | error
-  micIcon.classList.toggle("hidden",  state === "recording" || state === "processing");
-  stopIcon.classList.toggle("hidden", state !== "recording");
-  spinIcon.classList.toggle("hidden", state !== "processing");
-  micBtn.classList.toggle("recording",  state === "recording");
-  micBtn.classList.toggle("processing", state === "processing");
-  micRingPulse.classList.toggle("recording", state === "recording");
-  voiceWaveform.classList.toggle("active", state === "recording");
-  micLabel.classList.toggle("recording",  state === "recording");
-  micLabel.classList.toggle("processing", state === "processing");
+  micIcon?.classList.toggle("hidden",  state === "recording" || state === "processing");
+  stopIcon?.classList.toggle("hidden", state !== "recording");
+  spinIcon?.classList.toggle("hidden", state !== "processing");
+  micBtn?.classList.toggle("recording",  state === "recording");
+  micBtn?.classList.toggle("processing", state === "processing");
+  micRingPulse?.classList.toggle("recording", state === "recording");
+  voiceWaveform?.classList.toggle("active", state === "recording");
+  micLabel?.classList.toggle("recording",  state === "recording");
+  micLabel?.classList.toggle("processing", state === "processing");
 
-  if (state === "idle" || state === "done") micLabel.textContent = "Tap to speak";
-  else if (state === "recording")  micLabel.textContent = "Recording…";
-  else if (state === "processing") micLabel.textContent = "Processing…";
-  else if (state === "error")      micLabel.textContent = "Error — tap to retry";
+  if (micLabel) {
+    if (state === "idle" || state === "done") micLabel.textContent = "Tap to speak";
+    else if (state === "recording")  micLabel.textContent = "Recording…";
+    else if (state === "processing") micLabel.textContent = "Processing…";
+    else if (state === "error")      micLabel.textContent = "Error — tap to retry";
+  }
 }
 
 function clearOutput() {
-  transcriptRow.classList.remove("visible");
-  responseRow.classList.remove("visible");
-  warningRow.classList.add("hidden");
-  errorRow.classList.add("hidden");
-  actionChip.classList.add("hidden");
-  replayBtn.classList.add("hidden");
+  transcriptRow?.classList.remove("visible");
+  responseRow?.classList.remove("visible");
+  warningRow?.classList.add("hidden");
+  errorRow?.classList.add("hidden");
+  actionChip?.classList.add("hidden");
+  replayBtn?.classList.add("hidden");
   lastAudioUrl = null;
 }
 
 function showResult(result) {
-  transcriptText.textContent = result.transcription || "(inaudible)";
-  transcriptRow.classList.add("visible");
+  if (transcriptText) transcriptText.textContent = result.transcription || "(inaudible)";
+  transcriptRow?.classList.add("visible");
 
-  responseText.textContent = result.ai_response || "";
-  responseRow.classList.add("visible");
+  if (responseText) responseText.textContent = result.ai_response || "";
+  responseRow?.classList.add("visible");
 
   // Action chip
   const action = result.action || {};
   const atype  = action.action || "unknown";
-  if (atype && atype !== "unknown") {
+  if (atype && atype !== "unknown" && actionChip) {
     actionChip.textContent = atype.replace("_", " ");
     actionChip.className   = `action-chip action-${atype}`;
     actionChip.classList.remove("hidden");
   }
 
   // Warning
-  if (result.submit_guard_triggered && result.warning) {
+  if (result.submit_guard_triggered && result.warning && warningText) {
     warningText.textContent = result.warning;
-    warningRow.classList.remove("hidden");
+    warningRow?.classList.remove("hidden");
   }
 
   // Replay
-  if (result.audio_file) {
+  if (result.audio_file && replayBtn) {
     const fname  = result.audio_file.replace(/\\/g, "/").split("/").pop();
     lastAudioUrl = `${BACKEND}/voice/audio/${fname}`;
     replayBtn.classList.remove("hidden");
@@ -177,8 +223,8 @@ function showResult(result) {
 }
 
 function showError(msg) {
-  errorText.textContent = msg;
-  errorRow.classList.remove("hidden");
+  if (errorText) errorText.textContent = msg;
+  errorRow?.classList.remove("hidden");
   setVoiceState("error");
 }
 
@@ -814,27 +860,25 @@ async function processVoiceAudio() {
 }
 
 // ── Mic button ────────────────────────────────────────────────────────────
-micBtn.addEventListener("click", () => {
+if (micBtn) micBtn.addEventListener("click", () => {
   if (isRecording) stopRecording();
   else             startRecording();
 });
 
-replayBtn.addEventListener("click", () => {
+if (replayBtn) replayBtn.addEventListener("click", () => {
   if (lastAudioUrl) playAudio(lastAudioUrl, "voice");
 });
 
 // ── CoPilot toggle ────────────────────────────────────────────────────────
 chrome.storage.local.get(["copilotEnabled"], (data) => {
   const on = data.copilotEnabled === true;
-  copilotToggle.checked  = on;
-  toggleLabel.textContent = on ? "ON" : "OFF";
-  toggleLabel.classList.toggle("on", on);
+  if (copilotToggle) copilotToggle.checked  = on;
+  if (toggleLabel) { toggleLabel.textContent = on ? "ON" : "OFF"; toggleLabel.classList.toggle("on", on); }
 });
 
-copilotToggle.addEventListener("change", async () => {
+if (copilotToggle) copilotToggle.addEventListener("change", async () => {
   const enabled = copilotToggle.checked;
-  toggleLabel.textContent = enabled ? "ON" : "OFF";
-  toggleLabel.classList.toggle("on", enabled);
+  if (toggleLabel) { toggleLabel.textContent = enabled ? "ON" : "OFF"; toggleLabel.classList.toggle("on", enabled); }
   chrome.storage.local.set({ copilotEnabled: enabled });
 
   try {

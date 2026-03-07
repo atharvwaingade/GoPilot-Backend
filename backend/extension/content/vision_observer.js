@@ -393,8 +393,25 @@
   }
 
   // ── Audio context + playback ──────────────────────────────────────────────
+  // AudioContext creation is deferred until after the first user gesture
+  // (click / keydown / touchend) to comply with the browser autoplay policy.
+  // https://developer.chrome.com/blog/autoplay/#web_audio
 
-  let _audioCtx = null;
+  let _audioCtx       = null;
+  let _userGestured   = false;
+  const _pendingAudio = [];   // URLs queued before first gesture
+
+  function _onUserGesture() {
+    _userGestured = true;
+    // Drain any audio that arrived before the first gesture
+    while (_pendingAudio.length > 0) {
+      _playAudioNow(_pendingAudio.shift());
+    }
+  }
+
+  document.addEventListener("click",   _onUserGesture, {capture:true, passive:true});
+  document.addEventListener("keydown",  _onUserGesture, {capture:true, passive:true});
+  document.addEventListener("touchend", _onUserGesture, {capture:true, passive:true});
 
   function _getAudioCtx() {
     if (!_audioCtx || _audioCtx.state === "closed")
@@ -403,31 +420,19 @@
     return _audioCtx;
   }
 
-  function _primeAudio() {
-    try {
-      const ctx = _getAudioCtx();
-      const buf = ctx.createBuffer(1,1,22050);
-      const src = ctx.createBufferSource();
-      src.buffer = buf; src.connect(ctx.destination); src.start(0);
-    } catch(_) {}
-  }
-
-  document.addEventListener("click",   _primeAudio, {capture:true});
-  document.addEventListener("keydown",  _primeAudio, {capture:true});
-  document.addEventListener("touchend", _primeAudio, {capture:true});
-
-  function playAudio(url) {
+  function _playAudioNow(url) {
     window.__copilotTTSPending = true;
     chrome.runtime.sendMessage({ type:"FETCH_AUDIO", url }, (response) => {
       if (chrome.runtime.lastError || !response?.ok) {
         window.__copilotTTSPending = false;
         return;
       }
+      let ctx;
+      try { ctx = _getAudioCtx(); } catch(_) { window.__copilotTTSPending = false; return; }
+      if (ctx.state === "suspended") { window.__copilotTTSPending = false; return; }
       const binary = atob(response.base64);
       const bytes  = new Uint8Array(binary.length);
       for (let i=0; i<binary.length; i++) bytes[i] = binary.charCodeAt(i);
-      const ctx = _getAudioCtx();
-      if (ctx.state === "suspended") { window.__copilotTTSPending = false; return; }
       ctx.decodeAudioData(bytes.buffer)
         .then(decoded => {
           const src = ctx.createBufferSource();
@@ -437,6 +442,15 @@
         })
         .catch(() => { window.__copilotTTSPending = false; });
     });
+  }
+
+  function playAudio(url) {
+    if (!_userGestured) {
+      // No gesture yet — queue for playback once the user interacts
+      _pendingAudio.push(url);
+      return;
+    }
+    _playAudioNow(url);
   }
 
   // ── Start ─────────────────────────────────────────────────────────────────
