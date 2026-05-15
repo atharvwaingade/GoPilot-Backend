@@ -102,6 +102,12 @@ pip install kokoro soundfile
 pip install pywin32
 ```
 
+For broader non-WAV STT input support (WebM/MP3/OGG), install:
+
+```bash
+pip install pydub
+```
+
 ### 6) Run the API server
 
 ```bash
