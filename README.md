@@ -1,6 +1,7 @@
 # GoPilot Backend
 
 GoPilot is a **real-time ERP/web form copilot backend** built with FastAPI.
+The runtime app name defaults to `CoPilot Platform` (configurable via `COPILOT_APP_NAME`).
 It combines:
 
 - DOM/screen-context understanding
@@ -255,7 +256,7 @@ Outgoing message types include:
 ### Voice transcription fails
 
 - Verify `openai-whisper` is installed
-- For non-WAV audio formats, ensure decode dependencies are available
+- For non-WAV audio formats, install decoder dependencies (commonly `ffmpeg`; `pydub` may also be required depending on format)
 
 ### No TTS audio generated
 
