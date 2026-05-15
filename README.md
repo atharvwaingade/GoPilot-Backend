@@ -86,10 +86,13 @@ pip install -r requirements.txt
 ### 4) Set up Ollama
 
 Start Ollama and pull the model used by this codebase (`qwen2.5:3b`).
-Run `ollama serve` in a separate terminal (or background session), then run the pull command:
+Run `ollama serve` in terminal A (it is a blocking process), then run the pull command in terminal B:
 
 ```bash
 ollama serve
+```
+
+```bash
 ollama pull qwen2.5:3b
 ```
 
@@ -266,6 +269,9 @@ Outgoing message types include:
 - For audio formats other than WAV, install decoder dependencies:
   - `ffmpeg` (system dependency; typically required)
   - `pydub` (Python package; commonly needed for WebM/MP3/OGG handling in this pipeline)
+- `ffmpeg` install examples:
+  - Ubuntu/Debian: `sudo apt-get install ffmpeg`
+  - macOS (Homebrew): `brew install ffmpeg`
 
 ### No TTS audio generated
 
