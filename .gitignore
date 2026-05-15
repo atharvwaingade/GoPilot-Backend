@@ -4,6 +4,7 @@
 # Except the backend folder and this ignore file
 !/backend/
 !.gitignore
+!README.md
 
 # Inside backend, still ignore the junk
 backend/**/__pycache__/
