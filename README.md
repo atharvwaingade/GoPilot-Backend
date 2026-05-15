@@ -102,7 +102,7 @@ pip install kokoro soundfile
 pip install pywin32
 ```
 
-For broader non-WAV STT input support (WebM/MP3/OGG), install:
+For broader audio input format support (WebM/MP3/OGG) in the STT pipeline, install:
 
 ```bash
 pip install pydub
@@ -262,7 +262,7 @@ Outgoing message types include:
 ### Voice transcription fails
 
 - Verify `openai-whisper` is installed
-- For non-WAV audio formats, install decoder dependencies:
+- For audio formats other than WAV, install decoder dependencies:
   - `ffmpeg` (system dependency; typically required)
   - `pydub` (Python package; commonly needed for WebM/MP3/OGG handling in this pipeline)
 
