@@ -256,7 +256,7 @@ Outgoing message types include:
 ### Voice transcription fails
 
 - Verify `openai-whisper` is installed
-- For non-WAV audio formats, install decoder dependencies (commonly `ffmpeg`; `pydub` may also be required depending on format)
+- For non-WAV audio formats, install decoder dependencies: `ffmpeg` is typically required, and `pydub` is commonly needed for WebM/MP3/OGG handling in this pipeline
 
 ### No TTS audio generated
 
