@@ -85,7 +85,8 @@ pip install -r requirements.txt
 
 ### 4) Set up Ollama
 
-Start Ollama and pull the model used by this codebase (`qwen2.5:3b`):
+Start Ollama and pull the model used by this codebase (`qwen2.5:3b`).
+Run `ollama serve` in a separate terminal (or background session), then run the pull command:
 
 ```bash
 ollama serve
@@ -248,7 +249,7 @@ Outgoing message types include:
 
 ## Development Notes
 
-- No test suite is currently checked into this repository.
+- As of this version, no test suite is checked into this repository.
 - API docs (`/docs`) are the fastest way to inspect request/response schemas.
 - The backend pre-warms STT/TTS on startup to reduce first-request latency.
 
