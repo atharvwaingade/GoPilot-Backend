@@ -1,5 +1,49 @@
 "use strict";
 
+// ── Missing-variable declarations ─────────────────────────────────────────
+// These were used throughout popup.js but never declared, causing runtime
+// ReferenceErrors visible in the extension Errors panel.
+
+// Tracks which tab IDs have already had scripts injected (avoids re-injection).
+const _injectedTabs = new Set();
+
+// Cache for tool-permission check results (avoids redundant network calls).
+const _permCache = new Map();
+
+// Timer handle for guided-mode auto-reopen of the microphone.
+let _guidedMicTimer = null;
+
+// Lightweight performance timing helpers (no-op when not needed).
+const _tTimers = {};
+function tStart(label) { _tTimers[label] = performance.now(); }
+function tEnd(label) {
+  if (_tTimers[label] != null) {
+    console.log(`[GoPilot ⏱] ${label}: ${(performance.now() - _tTimers[label]).toFixed(1)}ms`);
+    delete _tTimers[label];
+  }
+}
+
+/**
+ * resolveToolName — maps a field_id to the tool permission name used by the
+ * backend /tools/check endpoint.  Field IDs use snake_case; the backend
+ * currently accepts them as-is.  The function is kept as a thin normaliser
+ * so future remapping rules only need to be changed here.
+ *
+ * @param {string} fieldId  e.g. "product_category_2"
+ * @returns {string}        e.g. "fill_field"
+ */
+function resolveToolName(fieldId) {
+  if (!fieldId) return "fill_field";
+  // Specific high-risk fields get dedicated permission names so admins can
+  // block them individually.  Everything else falls back to "fill_field".
+  const HIGH_RISK_PREFIXES = ["invoice", "total", "amount", "discount", "tax", "payment"];
+  const lower = String(fieldId).toLowerCase();
+  for (const prefix of HIGH_RISK_PREFIXES) {
+    if (lower.startsWith(prefix)) return `fill_${prefix}_field`;
+  }
+  return "fill_field";
+}
+
 // ── Tab-stable session ID ─────────────────────────────────────────────────
 let _tabSessionId = null;
 
@@ -21,9 +65,27 @@ async function getTabSessionId() {
   return _tabSessionId;
 }
 
-const BACKEND     = "http://localhost:8000";
-const BACKEND_URL = BACKEND;
+const DEFAULT_BACKEND = "http://localhost:8000";
+// BACKEND is resolved from chrome.storage.local at startup (see _initBackend).
+// All code uses the `BACKEND` variable; it is reassigned before any user action.
+let BACKEND     = DEFAULT_BACKEND;
+let BACKEND_URL = DEFAULT_BACKEND;
 let lastScreenContext = {};
+
+// Read persisted backend URL from storage, update module variables and the
+// settings input, then inject updated config into the active tab's
+// vision_observer if it is already running.
+async function _initBackend() {
+  const data = await chrome.storage.local.get("gopilotBackendUrl");
+  const stored = (data.gopilotBackendUrl || "").trim().replace(/\/$/, "");
+  if (stored) {
+    BACKEND     = stored;
+    BACKEND_URL = stored;
+  }
+  const inp = document.getElementById("backend-url-input");
+  if (inp) inp.value = BACKEND;
+}
+_initBackend();
 
 // ── DOM refs ──────────────────────────────────────────────────────────────
 const micBtn        = document.getElementById("mic-btn");
@@ -100,56 +162,58 @@ async function playAudio(url, priority = "normal") {
 // ── UI state ──────────────────────────────────────────────────────────────
 function setVoiceState(state) {
   // states: idle | recording | processing | done | error
-  micIcon.classList.toggle("hidden",  state === "recording" || state === "processing");
-  stopIcon.classList.toggle("hidden", state !== "recording");
-  spinIcon.classList.toggle("hidden", state !== "processing");
-  micBtn.classList.toggle("recording",  state === "recording");
-  micBtn.classList.toggle("processing", state === "processing");
-  micRingPulse.classList.toggle("recording", state === "recording");
-  voiceWaveform.classList.toggle("active", state === "recording");
-  micLabel.classList.toggle("recording",  state === "recording");
-  micLabel.classList.toggle("processing", state === "processing");
+  micIcon?.classList.toggle("hidden",  state === "recording" || state === "processing");
+  stopIcon?.classList.toggle("hidden", state !== "recording");
+  spinIcon?.classList.toggle("hidden", state !== "processing");
+  micBtn?.classList.toggle("recording",  state === "recording");
+  micBtn?.classList.toggle("processing", state === "processing");
+  micRingPulse?.classList.toggle("recording", state === "recording");
+  voiceWaveform?.classList.toggle("active", state === "recording");
+  micLabel?.classList.toggle("recording",  state === "recording");
+  micLabel?.classList.toggle("processing", state === "processing");
 
-  if (state === "idle" || state === "done") micLabel.textContent = "Tap to speak";
-  else if (state === "recording")  micLabel.textContent = "Recording…";
-  else if (state === "processing") micLabel.textContent = "Processing…";
-  else if (state === "error")      micLabel.textContent = "Error — tap to retry";
+  if (micLabel) {
+    if (state === "idle" || state === "done") micLabel.textContent = "Tap to speak";
+    else if (state === "recording")  micLabel.textContent = "Recording…";
+    else if (state === "processing") micLabel.textContent = "Processing…";
+    else if (state === "error")      micLabel.textContent = "Error — tap to retry";
+  }
 }
 
 function clearOutput() {
-  transcriptRow.classList.remove("visible");
-  responseRow.classList.remove("visible");
-  warningRow.classList.add("hidden");
-  errorRow.classList.add("hidden");
-  actionChip.classList.add("hidden");
-  replayBtn.classList.add("hidden");
+  transcriptRow?.classList.remove("visible");
+  responseRow?.classList.remove("visible");
+  warningRow?.classList.add("hidden");
+  errorRow?.classList.add("hidden");
+  actionChip?.classList.add("hidden");
+  replayBtn?.classList.add("hidden");
   lastAudioUrl = null;
 }
 
 function showResult(result) {
-  transcriptText.textContent = result.transcription || "(inaudible)";
-  transcriptRow.classList.add("visible");
+  if (transcriptText) transcriptText.textContent = result.transcription || "(inaudible)";
+  transcriptRow?.classList.add("visible");
 
-  responseText.textContent = result.ai_response || "";
-  responseRow.classList.add("visible");
+  if (responseText) responseText.textContent = result.ai_response || "";
+  responseRow?.classList.add("visible");
 
   // Action chip
   const action = result.action || {};
   const atype  = action.action || "unknown";
-  if (atype && atype !== "unknown") {
+  if (atype && atype !== "unknown" && actionChip) {
     actionChip.textContent = atype.replace("_", " ");
     actionChip.className   = `action-chip action-${atype}`;
     actionChip.classList.remove("hidden");
   }
 
   // Warning
-  if (result.submit_guard_triggered && result.warning) {
+  if (result.submit_guard_triggered && result.warning && warningText) {
     warningText.textContent = result.warning;
-    warningRow.classList.remove("hidden");
+    warningRow?.classList.remove("hidden");
   }
 
   // Replay
-  if (result.audio_file) {
+  if (result.audio_file && replayBtn) {
     const fname  = result.audio_file.replace(/\\/g, "/").split("/").pop();
     lastAudioUrl = `${BACKEND}/voice/audio/${fname}`;
     replayBtn.classList.remove("hidden");
@@ -159,8 +223,8 @@ function showResult(result) {
 }
 
 function showError(msg) {
-  errorText.textContent = msg;
-  errorRow.classList.remove("hidden");
+  if (errorText) errorText.textContent = msg;
+  errorRow?.classList.remove("hidden");
   setVoiceState("error");
 }
 
@@ -796,27 +860,25 @@ async function processVoiceAudio() {
 }
 
 // ── Mic button ────────────────────────────────────────────────────────────
-micBtn.addEventListener("click", () => {
+if (micBtn) micBtn.addEventListener("click", () => {
   if (isRecording) stopRecording();
   else             startRecording();
 });
 
-replayBtn.addEventListener("click", () => {
+if (replayBtn) replayBtn.addEventListener("click", () => {
   if (lastAudioUrl) playAudio(lastAudioUrl, "voice");
 });
 
 // ── CoPilot toggle ────────────────────────────────────────────────────────
 chrome.storage.local.get(["copilotEnabled"], (data) => {
   const on = data.copilotEnabled === true;
-  copilotToggle.checked  = on;
-  toggleLabel.textContent = on ? "ON" : "OFF";
-  toggleLabel.classList.toggle("on", on);
+  if (copilotToggle) copilotToggle.checked  = on;
+  if (toggleLabel) { toggleLabel.textContent = on ? "ON" : "OFF"; toggleLabel.classList.toggle("on", on); }
 });
 
-copilotToggle.addEventListener("change", async () => {
+if (copilotToggle) copilotToggle.addEventListener("change", async () => {
   const enabled = copilotToggle.checked;
-  toggleLabel.textContent = enabled ? "ON" : "OFF";
-  toggleLabel.classList.toggle("on", enabled);
+  if (toggleLabel) { toggleLabel.textContent = enabled ? "ON" : "OFF"; toggleLabel.classList.toggle("on", enabled); }
   chrome.storage.local.set({ copilotEnabled: enabled });
 
   try {
@@ -829,3 +891,564 @@ copilotToggle.addEventListener("change", async () => {
     });
   } catch (e) { console.warn("[GoPilot] Toggle failed:", e.message); }
 });
+// ── Settings panel ────────────────────────────────────────────────────────
+const settingsBtn   = document.getElementById("settings-btn");
+const settingsPanel = document.getElementById("settings-panel");
+const backendInput  = document.getElementById("backend-url-input");
+const saveBackendBtn= document.getElementById("save-backend-btn");
+
+if (settingsBtn && settingsPanel) {
+  settingsBtn.addEventListener("click", () => {
+    settingsPanel.classList.toggle("open");
+    // Refresh input in case storage changed externally
+    if (backendInput) backendInput.value = BACKEND;
+  });
+}
+
+if (saveBackendBtn && backendInput) {
+  saveBackendBtn.addEventListener("click", async () => {
+    const val = backendInput.value.trim().replace(/\/$/, "");
+    if (!val) return;
+    // Validate it looks like a URL
+    if (!/^https?:\/\/.+/.test(val)) {
+      backendInput.style.borderColor = "var(--danger)";
+      setTimeout(() => backendInput.style.borderColor = "", 1500);
+      return;
+    }
+    BACKEND     = val;
+    BACKEND_URL = val;
+    await chrome.storage.local.set({ gopilotBackendUrl: val });
+    // Tell vision_observer running in the active tab about the new URL
+    try {
+      const tab = await getActiveTab();
+      await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func:   (url) => { if (window.__copilotSetBackend) window.__copilotSetBackend(url); },
+        args:   [val],
+      });
+    } catch (_) {}
+    settingsPanel.classList.remove("open");
+    console.log("[GoPilot] Backend URL updated to:", val);
+  });
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// PRODUCTION COPILOT FEATURES — Tab switching, Chat history, Text commands,
+//   Explain tab, Context tab, Navigate tab, Quick commands
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── Tab switching ────────────────────────────────────────────────────────────
+document.querySelectorAll(".tab[data-tab]").forEach(btn => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".tab[data-tab]").forEach(t => t.classList.remove("active"));
+    btn.classList.add("active");
+    const id = btn.dataset.tab;
+    document.querySelectorAll(".tab-panel[id^='tab-']").forEach(p => {
+      p.classList.toggle("hidden", p.id !== `tab-${id}`);
+    });
+    if (id === "context")  _autoScanContext();
+    if (id === "navigate") _populateNavTiles();
+  });
+});
+
+// ── Workflow selector — wire real <select> to voiceWorkflowSelect stub ────────
+const _workflowSelectEl = document.getElementById("workflow-select");
+if (_workflowSelectEl) {
+  Object.defineProperty(voiceWorkflowSelect, "value", {
+    get: () => _workflowSelectEl.value || "free",
+    configurable: true,
+  });
+}
+
+// ── Chat history ──────────────────────────────────────────────────────────────
+const _chatEl      = document.getElementById("chat-history");
+const _chatHistory = [];
+const MAX_CHAT_TURNS = 12;
+
+function _appendChat(role, text, { actionType = null, audioUrl = null } = {}) {
+  if (!text || !_chatEl) return;
+  _chatHistory.push({ role, text, actionType, audioUrl });
+  if (_chatHistory.length > MAX_CHAT_TURNS) _chatHistory.shift();
+
+  const bubble  = document.createElement("div");
+  bubble.className = `chat-bubble chat-bubble--${role}`;
+
+  const labelRow = document.createElement("div");
+  labelRow.className = "chat-bubble-label";
+  labelRow.textContent = role === "you" ? "You" : "GoPilot";
+
+  if (role === "ai" && audioUrl) {
+    const rep = document.createElement("button");
+    rep.className = "chat-replay-inline";
+    rep.title = "Replay";
+    rep.textContent = "▶";
+    rep.addEventListener("click", () => playAudio(audioUrl, "voice"));
+    labelRow.appendChild(rep);
+  }
+
+  const textEl = document.createElement("div");
+  textEl.textContent = text;
+  bubble.appendChild(labelRow);
+  bubble.appendChild(textEl);
+
+  if (role === "ai" && actionType && actionType !== "unknown") {
+    const badge = document.createElement("span");
+    badge.className = `badge badge--${actionType}`;
+    badge.style.cssText = "margin-top:5px;display:inline-block;";
+    badge.textContent = actionType.replace("_", " ").toUpperCase();
+    bubble.appendChild(badge);
+  }
+
+  _chatEl.appendChild(bubble);
+  _chatEl.scrollTop = _chatEl.scrollHeight;
+}
+
+// ── Override showResult to write to chat history ──────────────────────────────
+const _origShowResult = showResult;
+showResult = function(result) {          // reassign global
+  _origShowResult(result);              // keep legacy elements updated (hidden)
+
+  const text    = result.transcription || "";
+  const aiText  = result.ai_response || result.spoken_response || "";
+  const action  = result.action || {};
+  const atype   = action.action || null;
+
+  let audioUrl = null;
+  if (result.audio_file) {
+    const fname = result.audio_file.replace(/\\/g, "/").split("/").pop();
+    audioUrl = `${BACKEND}/voice/audio/${fname}`;
+  }
+
+  if (text && text !== "(inaudible)") _appendChat("you", text);
+  if (aiText)                          _appendChat("ai", aiText, { actionType: atype, audioUrl });
+
+  // Show inline warning
+  if (result.submit_guard_triggered && result.warning) {
+    const wb = document.getElementById("voice-warning-box");
+    if (wb) { wb.textContent = "⚠ " + result.warning; wb.classList.remove("hidden"); }
+  }
+
+  const vs = document.getElementById("voice-status");
+  if (vs) vs.textContent = "TAP TO SPEAK";
+};
+
+// ── Override showError to write to chat history ───────────────────────────────
+const _origShowError = showError;
+showError = function(msg) {
+  _origShowError(msg);
+  const eb = document.getElementById("voice-error-box");
+  const em = document.getElementById("voice-error-msg");
+  if (eb && em) { em.textContent = msg; eb.classList.remove("hidden"); }
+  _appendChat("ai", "⚠ " + msg, { actionType: "error" });
+};
+
+// ── Override setVoiceState to update new UI elements ─────────────────────────
+const _origSetVoiceState = setVoiceState;
+setVoiceState = function(state) {
+  _origSetVoiceState(state);
+
+  const vs   = document.getElementById("voice-status");
+  const wf   = document.getElementById("voice-waveform");
+  const ring = document.getElementById("voice-ring");
+  const mb   = document.getElementById("mic-btn");
+  const dot  = document.getElementById("status-dot");
+
+  const labels = { idle:"TAP TO SPEAK", recording:"Recording…",
+                   processing:"Processing…", done:"TAP TO SPEAK", error:"Error — tap to retry" };
+  if (vs) {
+    vs.textContent = labels[state] || "TAP TO SPEAK";
+    vs.className   = "voice-status-text" +
+      (state === "recording" ? " recording" : state === "processing" ? " processing" :
+       state === "done"      ? " ok"        : "");
+  }
+  if (wf)   wf.classList.toggle("hidden", state !== "recording");
+  if (ring) { ring.classList.remove("recording","processing"); ring.classList.toggle("recording",  state === "recording");  ring.classList.toggle("processing", state === "processing"); }
+  if (mb)   { mb.classList.remove("recording","processing");   mb.classList.toggle("recording",    state === "recording");  mb.classList.toggle("processing",   state === "processing"); }
+  if (dot)  { dot.className = "dot " + (state === "recording" ? "dot--error" : state === "processing" ? "dot--busy" : "dot--ok"); }
+};
+
+// ── Override clearOutput to reset new warning/error boxes ────────────────────
+const _origClearOutput = clearOutput;
+clearOutput = function() {
+  _origClearOutput();
+  const wb = document.getElementById("voice-warning-box");
+  const eb = document.getElementById("voice-error-box");
+  if (wb) wb.classList.add("hidden");
+  if (eb) eb.classList.add("hidden");
+};
+
+// ── Text-input command ────────────────────────────────────────────────────────
+async function processTextCommand(rawText) {
+  const text = (rawText || "").trim();
+  if (!text) return;
+
+  // Switch to voice tab so the user sees the result
+  document.querySelector('.tab[data-tab="voice"]')?.click();
+  clearOutput();
+  setVoiceState("processing");
+  _appendChat("you", text);
+
+  try {
+    const tab = await getActiveTab();
+    let ctx = lastScreenContext || {};
+    try { ctx = await extractContext(tab.id); lastScreenContext = ctx; } catch (_) {}
+
+    const sessionId = await getTabSessionId();
+
+    // Call /voice/text (text-only pipeline, no STT)
+    const res = await fetch(`${BACKEND}/voice/text`, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        text:           text,
+        workflow:       voiceWorkflowSelect?.value || "free",
+        session_id:     sessionId,
+        screen_context: ctx,
+      }),
+    });
+
+    if (!res.ok) throw new Error(`Server error ${res.status}`);
+    const result = await res.json();
+
+    showResult(result);   // writes to chat history via override above
+
+    const action    = result.action || {};
+    const isNavAct  = result.nav_action === true;
+    const isFillAct = action.action === "tool_call" && !result.submit_guard_triggered;
+
+    if (result.audio_file && !isFillAct) {
+      const fname = result.audio_file.replace(/\\/g, "/").split("/").pop();
+      await playAudio(`${BACKEND}/voice/audio/${fname}`, "voice");
+    }
+
+    if ((isFillAct || isNavAct) && action.action) {
+      const execResult = await executeAction(tab.id, action);
+      if (execResult?.ok === false && action.action === "tool_call") {
+        await voiceExecutorError(execResult.reason || "Unknown error", action);
+        return;
+      }
+      if (action.action === "tool_call") {
+        const isSubmit = action.field_id === "submit" || /^(submit|save)$/i.test(action.label || "");
+        if (isSubmit) readbackSubmit(tab.id); else await readbackFill(tab.id, action);
+      } else if (isNavAct) {
+        readbackNav(tab.id);
+      }
+    }
+
+    if (result.multi_fill_active) setTimeout(() => _triggerNextMultiFill(), 400);
+
+  } catch (e) {
+    showError(e.message || "Command failed.");
+  } finally {
+    setVoiceState("done");
+  }
+}
+
+const _textInput   = document.getElementById("text-input");
+const _textSendBtn = document.getElementById("text-send-btn");
+if (_textInput && _textSendBtn) {
+  _textSendBtn.addEventListener("click", () => {
+    const t = _textInput.value.trim();
+    if (t) { _textInput.value = ""; processTextCommand(t); }
+  });
+  _textInput.addEventListener("keydown", e => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      const t = _textInput.value.trim();
+      if (t) { _textInput.value = ""; processTextCommand(t); }
+    }
+  });
+}
+
+// ── Quick command chips ────────────────────────────────────────────────────────
+document.querySelectorAll(".chip[data-cmd]").forEach(chip => {
+  chip.addEventListener("click", async () => {
+    const cmd = chip.dataset.cmd;
+    if (!cmd) return;
+    if (cmd.toLowerCase().includes("explain")) {
+      document.querySelector('.tab[data-tab="explain"]')?.click();
+      setTimeout(() => document.getElementById("explain-btn")?.click(), 80);
+      return;
+    }
+    await processTextCommand(cmd);
+  });
+});
+
+// ── EXPLAIN TAB ────────────────────────────────────────────────────────────────
+async function _explainPage(instruction) {
+  const btn    = document.getElementById("explain-btn");
+  const result = document.getElementById("explain-result");
+  const text   = document.getElementById("explain-text");
+  const title  = document.getElementById("explain-page-title");
+  const errBox = document.getElementById("explain-error-box");
+  const errMsg = document.getElementById("explain-error-msg");
+
+  if (btn) btn.disabled = true;
+  if (errBox) errBox.classList.add("hidden");
+
+  try {
+    const tab = await getActiveTab();
+    let ctx = lastScreenContext || {};
+    try { ctx = await extractContext(tab.id); lastScreenContext = ctx; } catch (_) {}
+
+    const res = await fetch(`${BACKEND}/vision/explain`, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        screen_context:   ctx,
+        user_instruction: instruction || "Explain this page",
+        session_id:       "",
+      }),
+    });
+
+    if (!res.ok) throw new Error(`Server error ${res.status}`);
+    const data = await res.json();
+
+    const explanation = data.explanation || data.page_purpose || "I can see this page is ready to use.";
+    if (result) result.classList.remove("hidden");
+    if (text)   text.textContent  = explanation;
+    if (title)  title.textContent = data.page_title || "";
+
+    // Speak the explanation via backend TTS
+    const speakRes = await fetch(`${BACKEND}/voice/announce`, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify({ screen_context: ctx, session_id: "" }),
+    }).catch(() => null);
+    if (speakRes?.ok) {
+      const sd = await speakRes.json();
+      if (sd.audio_file) {
+        const fname = sd.audio_file.replace(/\\/g, "/").split("/").pop();
+        playAudio(`${BACKEND}/voice/audio/${fname}`, "voice");
+      }
+    }
+
+  } catch (e) {
+    if (errBox) errBox.classList.remove("hidden");
+    if (errMsg) errMsg.textContent = e.message || "Failed to explain page.";
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+document.getElementById("explain-btn")?.addEventListener("click", () => _explainPage(""));
+document.getElementById("explain-ask-btn")?.addEventListener("click", () => {
+  const q = document.getElementById("explain-question")?.value?.trim();
+  if (!q) return;
+  document.getElementById("explain-question").value = "";
+  _explainPage(q);
+});
+document.getElementById("explain-question")?.addEventListener("keydown", e => {
+  if (e.key === "Enter") { e.preventDefault(); document.getElementById("explain-ask-btn")?.click(); }
+});
+
+// ── CONTEXT TAB ────────────────────────────────────────────────────────────────
+async function _autoScanContext() {
+  const fl = document.getElementById("field-list");
+  if (!fl || fl.children.length > 0) return;  // already populated
+  await _scanContextFields();
+}
+
+async function _scanContextFields() {
+  const scanBtn  = document.getElementById("scan-btn");
+  const fieldList = document.getElementById("field-list");
+  if (!fieldList) return;
+  if (scanBtn) { scanBtn.disabled = true; scanBtn.innerHTML = '<span class="btn-icon">🔄</span> Scanning…'; }
+
+  try {
+    const tab = await getActiveTab();
+    const ctx = await extractContext(tab.id);
+    lastScreenContext = ctx;
+
+    const allFields = (ctx.sections || []).flatMap(s => s.fields || []);
+    const fillable  = allFields.filter(f => !f.readonly && !f.calculated);
+    const filled    = fillable.filter(f => f.value && String(f.value).trim());
+    const req       = allFields.filter(f => f.required && !f.readonly);
+    const missing   = req.filter(f => !(f.value && String(f.value).trim()));
+
+    document.getElementById("stat-total").textContent    = fillable.length;
+    document.getElementById("stat-filled").textContent   = filled.length;
+    document.getElementById("stat-required").textContent = req.length;
+    document.getElementById("stat-missing").textContent  = missing.length;
+
+    fieldList.innerHTML = "";
+    const display = allFields.filter(f => !f.calculated).slice(0, 35);
+
+    if (!display.length) {
+      fieldList.innerHTML = '<div style="color:var(--muted);font-size:11px;text-align:center;padding:12px 0;">No form fields found on this page.</div>';
+    } else {
+      display.forEach(f => {
+        const item  = document.createElement("div");
+        item.className = "field-item";
+        item.title     = f.readonly ? "Read-only field" : `Click to fill "${f.label || f.field_id}"`;
+
+        const left  = document.createElement("div");
+        left.className = "field-item-left";
+        const idEl  = document.createElement("div");
+        idEl.className = "field-item-id";
+        idEl.textContent = f.field_id || "—";
+        const lblEl = document.createElement("div");
+        lblEl.className = "field-item-label";
+        lblEl.textContent = f.label || f.field_id;
+        left.append(idEl, lblEl);
+
+        let statusText, statusClass;
+        if (f.readonly || f.calculated) {
+          statusText = "read-only"; statusClass = "field-status--readonly";
+        } else if (f.value && String(f.value).trim()) {
+          statusText = "✓ " + String(f.value).slice(0, 12); statusClass = "field-status--filled";
+        } else if (f.required) {
+          statusText = "⚠ missing"; statusClass = "field-status--missing";
+        } else {
+          statusText = "empty"; statusClass = "field-status--readonly";
+        }
+
+        const st = document.createElement("span");
+        st.className = `field-status ${statusClass}`;
+        st.textContent = statusText;
+
+        item.append(left, st);
+
+        // Click → switch to Voice tab, pre-fill the text input
+        if (!f.readonly && !f.calculated) {
+          item.addEventListener("click", () => {
+            document.querySelector('.tab[data-tab="voice"]')?.click();
+            const ti = document.getElementById("text-input");
+            if (ti) { ti.value = `Fill ${f.label || f.field_id} `; ti.focus(); }
+          });
+        }
+        fieldList.appendChild(item);
+      });
+    }
+  } catch (e) {
+    if (fieldList) fieldList.innerHTML = `<div style="color:var(--red);font-size:11px;padding:8px 0;">Scan failed: ${e.message}</div>`;
+  } finally {
+    if (scanBtn) { scanBtn.disabled = false; scanBtn.innerHTML = '<span class="btn-icon">🔍</span> Scan Page Fields'; }
+  }
+}
+
+document.getElementById("scan-btn")?.addEventListener("click", _scanContextFields);
+
+// ── NAVIGATE TAB ────────────────────────────────────────────────────────────────
+async function _populateNavTiles() {
+  const area = document.getElementById("nav-dynamic");
+  if (!area || area.dataset.done === "1") return;
+  try {
+    const tab = await getActiveTab();
+    const ctx = await extractContext(tab.id).catch(() => lastScreenContext || {});
+    lastScreenContext = ctx;
+
+    const navLinks = [
+      ...(ctx.nav_links || []),
+      ...(ctx.buttons  || []).filter(b => b.is_nav && !b.disabled),
+    ].slice(0, 9);
+
+    if (!navLinks.length) return;
+
+    const sep = document.createElement("div");
+    sep.style.cssText = "font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-bottom:2px;";
+    sep.textContent = "Page links";
+    area.appendChild(sep);
+
+    navLinks.forEach(link => {
+      const lbl = (link.label || "")
+        .replace(/\([^)]*\)/g, "")
+        .replace(/[\u0900-\u0D7F]+/g, "")
+        .trim();
+      if (!lbl || lbl.length < 2) return;
+
+      const chip = document.createElement("button");
+      chip.className = "chip";
+      chip.textContent = lbl;
+      chip.addEventListener("click", () => _processNavAction(`go to ${lbl}`));
+      area.appendChild(chip);
+    });
+
+    area.dataset.done = "1";
+  } catch (_) {}
+}
+
+async function _processNavAction(instruction) {
+  document.querySelector('.tab[data-tab="voice"]')?.click();
+  clearOutput();
+  setVoiceState("processing");
+  _appendChat("you", instruction);
+
+  try {
+    const tab = await getActiveTab();
+    let ctx = lastScreenContext || {};
+    try { ctx = await extractContext(tab.id); lastScreenContext = ctx; } catch (_) {}
+
+    // Delegate to /voice/text so the full nav resolution pipeline runs
+    const sessionId = await getTabSessionId();
+    const res = await fetch(`${BACKEND}/voice/text`, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        text:           instruction,
+        workflow:       "free",
+        session_id:     sessionId,
+        screen_context: ctx,
+      }),
+    });
+
+    if (!res.ok) throw new Error(`Server error ${res.status}`);
+    const result = await res.json();
+    const action = result.action || {};
+
+    // Announce
+    const spoken = result.ai_response || "";
+    if (spoken) _appendChat("ai", spoken, { actionType: action.action || "navigate" });
+
+    if (result.audio_file) {
+      const fname = result.audio_file.replace(/\\/g, "/").split("/").pop();
+      await playAudio(`${BACKEND}/voice/audio/${fname}`, "voice");
+    }
+
+    if (action.action === "navigate" || action.action === "click") {
+      const execResult = await executeAction(tab.id, action);
+      if (execResult?.ok !== false) readbackNav(tab.id);
+    }
+
+  } catch (e) {
+    _appendChat("ai", "Navigation failed: " + e.message, { actionType: "error" });
+  } finally {
+    setVoiceState("done");
+  }
+}
+
+// Nav grid tiles
+document.querySelectorAll(".nav-tile[data-nav]").forEach(tile => {
+  tile.addEventListener("click", () => _processNavAction(tile.dataset.nav));
+});
+
+// Nav text input
+const _navInput = document.getElementById("nav-input");
+const _navGoBtn = document.getElementById("nav-go-btn");
+if (_navGoBtn && _navInput) {
+  _navGoBtn.addEventListener("click", () => {
+    const cmd = _navInput.value.trim();
+    if (!cmd) return;
+    _navInput.value = "";
+    _processNavAction(cmd);
+  });
+  _navInput.addEventListener("keydown", e => {
+    if (e.key === "Enter") { e.preventDefault(); _navGoBtn.click(); }
+  });
+}
+
+// ── Status dot check on startup ───────────────────────────────────────────────
+(async () => {
+  try {
+    const res = await fetch(`${BACKEND}/plugins`, { signal: AbortSignal.timeout(3000) }).catch(() => null);
+    const dot = document.getElementById("status-dot");
+    const lbl = document.getElementById("status-label");
+    if (res?.ok) {
+      if (dot) dot.className = "dot dot--ok";
+      if (lbl) lbl.textContent = "READY";
+    } else {
+      if (dot) dot.className = "dot dot--error";
+      if (lbl) lbl.textContent = "OFFLINE";
+    }
+  } catch (_) {}
+})();

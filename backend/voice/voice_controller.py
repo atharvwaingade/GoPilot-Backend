@@ -408,8 +408,8 @@ def _apply_submit_guard(
                             w.spoken for w in
                             _rv.validate_before_submit(screen_context)
                         ]
-                    except Exception:
-                        pass
+                    except Exception as _rv_err:
+                        logger.debug("realtime_validator failed: %s", _rv_err)
                 if pre_warnings:
                     return action, " ".join(pre_warnings) + " Please fix these before submitting."
 
@@ -865,16 +865,28 @@ class VoiceController:
                 if not _pending_hint:
                     n = len(llm_batch)
                     _pending_hint = f" I'll fill {n} more {'field' if n==1 else 'fields'} after this."
-        except Exception:
-            pass
+        except Exception as _batch_err:
+            logger.debug("LLM batch queue enrichment failed: %s", _batch_err)
 
-        # Enrich tool_call with label+type from DOM for better speech
-        if action.get("action") == "tool_call" and not action.get("label"):
+        # Enrich tool_call with label, type, dom_id, and placeholder from DOM.
+        # dom_id and placeholder are forwarded to executor.js as fallback lookup
+        # keys so the element can be found even after a React re-render wipes
+        # the data-copilot-field-id stamp.
+        if action.get("action") == "tool_call":
             fid = action.get("field_id","")
             for section in screen_context.get("sections",[]):
                 for f in section.get("fields",[]):
                     if f.get("field_id") == fid:
-                        action = {**action, "label": f.get("label",""), "type": f.get("type","text")}
+                        extras: dict = {}
+                        if not action.get("label"):
+                            extras["label"] = f.get("label","")
+                            extras["type"]  = f.get("type","text")
+                        if not action.get("dom_id") and f.get("dom_id"):
+                            extras["dom_id"] = f.get("dom_id")
+                        if not action.get("placeholder") and f.get("placeholder"):
+                            extras["placeholder"] = f.get("placeholder")
+                        if extras:
+                            action = {**action, **extras}
                         break
 
         # ── 6b. Semantic field classification (Stage 3.1) ─────────────────
@@ -979,6 +991,59 @@ class VoiceController:
             multi_fill_active=_mf_active,
             guided_fill_active=guided_fill_manager.is_in_guided_session(session_id),
         )
+
+    # ── Public: process one text turn (skips STT) ────────────────────────────
+
+    def process_text(
+        self,
+        text:          str,
+        workflow_name: str,
+        screen_context: dict,
+        session_id:    str,
+        ai_step_fn,
+        play_audio:    bool = False,
+    ) -> "VoiceResult":
+        """
+        Run one complete turn with a pre-supplied text instruction (no STT).
+
+        Identical to process() but skips step 1 (speech-to-text) so the
+        popup text input, Tauri app, and /voice/text REST endpoint can all
+        participate in the same pipeline without needing audio.
+        """
+        # Inject the text as the raw transcription and delegate to process()
+        # We synthesise a trivially small silent WAV so process() works unchanged.
+        import struct, time as _time
+
+        # 10-ms silent 16kHz mono WAV  (44 byte header + 160 samples)
+        num_samples = 160
+        header = struct.pack(
+            "<4sI4s4sIHHIIHH4sI",
+            b"RIFF", 36 + num_samples * 2, b"WAVE",
+            b"fmt ", 16, 1, 1, 16000, 32000, 2, 16,
+            b"data", num_samples * 2,
+        )
+        silent_wav = header + b"\x00" * (num_samples * 2)
+
+        # Temporarily monkey-patch the STT engine so it returns our text
+        # rather than transcribing silence.  Thread-safe because each request
+        # calls process_text() on the same controller instance sequentially.
+        _orig_transcribe = self._stt.transcribe_bytes
+        self._stt.transcribe_bytes = lambda _b, suffix=".wav": text
+
+        try:
+            result = self.process(
+                audio_bytes=silent_wav,
+                workflow_name=workflow_name,
+                screen_context=screen_context,
+                session_id=session_id,
+                ai_step_fn=ai_step_fn,
+                play_audio=play_audio,
+                audio_suffix=".wav",
+            )
+        finally:
+            self._stt.transcribe_bytes = _orig_transcribe
+
+        return result
 
     # ── Public: proactive page announcement ───────────────────────────────────
 

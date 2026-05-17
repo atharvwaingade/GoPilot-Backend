@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+import threading
 from typing import Any
 
 from pydantic import ValidationError
@@ -13,13 +14,16 @@ logger = logging.getLogger(__name__)
 
 # Module-level queue for multi-fill batches from LLM array responses.
 # voice_controller drains this after processing the first action.
+# Protected by a lock so concurrent requests don't corrupt each other's batches.
+_llm_batch_lock:  threading.Lock = threading.Lock()
 _llm_batch_queue: list[dict] = []
 
 
 def pop_llm_batch() -> list[dict]:
     """Drain and return any pending batch fills from the last LLM array response."""
-    batch = list(_llm_batch_queue)
-    _llm_batch_queue.clear()
+    with _llm_batch_lock:
+        batch = list(_llm_batch_queue)
+        _llm_batch_queue.clear()
     return batch
 
 _JSON_GREEDY_RE    = re.compile(r"\{.*\}",  re.DOTALL)
@@ -196,6 +200,19 @@ def _sanitise(data: dict, action_type: ActionType) -> dict:
 
 
 def parse_llm_output(raw: str, calculated_fields: list[str], readonly_fields: list[str]) -> LLMAction:
+    # ── Pre-validation: reject obviously hallucinated output ─────────────────
+    # When the model echoes back the prompt (e.g. outputs {"field_id":"fields","value":"MAP:..."})
+    # the value contains JSON-like content.  Reject immediately.
+    _PROMPT_ECHO_RE = re.compile(
+        r"""(?x)
+        ^\s*(?:MAP:|CMD:|OUT:|FIELDS:|TASK:|JSON:)   # prompt prefix echoed as value
+        | \{["\s]*action["\s]*:                       # raw action JSON inside value
+        | [{}]{2,}                                    # }{} artifact
+        """, re.IGNORECASE
+    )
+    _RESERVED_FIELD_IDS = {"fields", "field_map", "map", "fieldmap", "fields_map",
+                           "task", "json", "out", "cmd", "instruction"}
+
     # ── Handle JSON array (multi-fill response) ────────────────────────────
     # The upgraded system prompt can return an array of tool_calls.
     # We return the FIRST one here; the rest are handled by the multi-fill
@@ -223,16 +240,18 @@ def parse_llm_output(raw: str, calculated_fields: list[str], readonly_fields: li
                             if act.field_id in calculated_fields or act.field_id in readonly_fields:
                                 continue
                         valid_actions.append(act)
-                    except Exception:
+                    except Exception as _ve:
+                        logger.debug("Array element validation failed: %s", _ve)
                         continue
                 if valid_actions:
                     logger.info("LLM returned %d-fill array", len(valid_actions))
                     # Store batch in module-level queue — voice_controller drains it
                     if len(valid_actions) > 1:
-                        _llm_batch_queue.clear()
-                        _llm_batch_queue.extend(
-                            a.model_dump() for a in valid_actions[1:]
-                        )
+                        with _llm_batch_lock:
+                            _llm_batch_queue.clear()
+                            _llm_batch_queue.extend(
+                                a.model_dump() for a in valid_actions[1:]
+                            )
                     return valid_actions[0]
         except (json.JSONDecodeError, Exception) as exc:
             logger.warning("Array parse failed: %s", exc)
@@ -281,6 +300,17 @@ def parse_llm_output(raw: str, calculated_fields: list[str], readonly_fields: li
             return ErrorAction(reason=f"'{action.field_id}' is calculated", raw_output=raw[:500])
         if action.field_id in readonly_fields:
             return ErrorAction(reason=f"'{action.field_id}' is readonly", raw_output=raw[:500])
+        # Reject prompt-echo hallucinations
+        if action.field_id.lower() in _RESERVED_FIELD_IDS:
+            return ErrorAction(
+                reason=f"Hallucinated field_id '{action.field_id}' (reserved name)",
+                raw_output=raw[:500],
+            )
+        if action.value and _PROMPT_ECHO_RE.search(str(action.value)):
+            return ErrorAction(
+                reason=f"Hallucinated value — prompt echo: {str(action.value)[:80]}",
+                raw_output=raw[:500],
+            )
 
     logger.debug("Validated: %s field_id=%s", action_type.value,
                  getattr(action, 'field_id', '-'))

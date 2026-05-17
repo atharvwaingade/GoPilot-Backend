@@ -6,6 +6,7 @@
  *   - Toggle ON/OFF state tracked (reads from chrome.storage.local)
  *   - Plays TTS audio from backend directly on navigation
  *   - Exposes window.__copilotToggle(enabled) for popup to call
+ *   - Exposes window.__copilotSetBackend(url) so popup can change backend URL
  */
 
 (function () {
@@ -15,8 +16,11 @@
   window.__copilotVisionObserverLoaded = true;
 
   // ── Config ────────────────────────────────────────────────────────────────
-  const BACKEND       = "http://localhost:8000";
-  const WS_URL        = "ws://localhost:8000/ws/vision";
+  const DEFAULT_BACKEND = "http://localhost:8000";
+  // BACKEND and WS_URL are mutable so popup can update them at runtime via
+  // window.__copilotSetBackend(url).
+  let BACKEND       = DEFAULT_BACKEND;
+  let WS_URL        = `${DEFAULT_BACKEND.replace(/^http/, "ws")}/ws/vision`;
   const POLL_INTERVAL = 800;
   const DEBOUNCE_MS   = 200;
   const RECONNECT_MS  = 3000;
@@ -35,8 +39,14 @@
   let currentUrl     = location.href;
   let copilotEnabled = false;   // tracks toggle state
 
-  // ── Load toggle state from storage ───────────────────────────────────────
-  chrome.storage.local.get(["copilotEnabled", "lastAnnouncedUrl"], (result) => {
+  // ── Load toggle state + backend URL from storage ──────────────────────────
+  chrome.storage.local.get(["copilotEnabled", "lastAnnouncedUrl", "gopilotBackendUrl"], (result) => {
+    // Apply persisted backend URL (allows non-default host/port without editing source)
+    const stored = (result.gopilotBackendUrl || "").trim().replace(/\/$/, "");
+    if (stored) {
+      BACKEND = stored;
+      WS_URL  = `${stored.replace(/^http/, "ws")}/ws/vision`;
+    }
     copilotEnabled = result.copilotEnabled === true;
     if (copilotEnabled) {
       // Only re-announce if this is a genuinely new page (not a popup re-open)
@@ -49,7 +59,21 @@
         }, 1200);
       }
     }
+    // Connect WebSocket after URL is resolved
+    connectWS();
   });
+
+  // Allow popup to update backend URL at runtime (applied to future fetch/WS calls).
+  // The WebSocket reconnect loop will pick up WS_URL on its next retry.
+  window.__copilotSetBackend = function(url) {
+    if (!url) return;
+    const clean = url.trim().replace(/\/$/, "");
+    BACKEND = clean;
+    WS_URL  = `${clean.replace(/^http/, "ws")}/ws/vision`;
+    // Force WebSocket reconnect so it uses the new URL immediately
+    if (ws) { try { ws.close(); } catch(_) {} }
+    console.log("[GoPilot] Backend URL updated to:", clean);
+  };
 
   // ── WebSocket ─────────────────────────────────────────────────────────────
 
@@ -369,8 +393,25 @@
   }
 
   // ── Audio context + playback ──────────────────────────────────────────────
+  // AudioContext creation is deferred until after the first user gesture
+  // (click / keydown / touchend) to comply with the browser autoplay policy.
+  // https://developer.chrome.com/blog/autoplay/#web_audio
 
-  let _audioCtx = null;
+  let _audioCtx       = null;
+  let _userGestured   = false;
+  const _pendingAudio = [];   // URLs queued before first gesture
+
+  function _onUserGesture() {
+    _userGestured = true;
+    // Drain any audio that arrived before the first gesture
+    while (_pendingAudio.length > 0) {
+      _playAudioNow(_pendingAudio.shift());
+    }
+  }
+
+  document.addEventListener("click",   _onUserGesture, {capture:true, passive:true});
+  document.addEventListener("keydown",  _onUserGesture, {capture:true, passive:true});
+  document.addEventListener("touchend", _onUserGesture, {capture:true, passive:true});
 
   function _getAudioCtx() {
     if (!_audioCtx || _audioCtx.state === "closed")
@@ -379,31 +420,19 @@
     return _audioCtx;
   }
 
-  function _primeAudio() {
-    try {
-      const ctx = _getAudioCtx();
-      const buf = ctx.createBuffer(1,1,22050);
-      const src = ctx.createBufferSource();
-      src.buffer = buf; src.connect(ctx.destination); src.start(0);
-    } catch(_) {}
-  }
-
-  document.addEventListener("click",   _primeAudio, {capture:true});
-  document.addEventListener("keydown",  _primeAudio, {capture:true});
-  document.addEventListener("touchend", _primeAudio, {capture:true});
-
-  function playAudio(url) {
+  function _playAudioNow(url) {
     window.__copilotTTSPending = true;
     chrome.runtime.sendMessage({ type:"FETCH_AUDIO", url }, (response) => {
       if (chrome.runtime.lastError || !response?.ok) {
         window.__copilotTTSPending = false;
         return;
       }
+      let ctx;
+      try { ctx = _getAudioCtx(); } catch(_) { window.__copilotTTSPending = false; return; }
+      if (ctx.state === "suspended") { window.__copilotTTSPending = false; return; }
       const binary = atob(response.base64);
       const bytes  = new Uint8Array(binary.length);
       for (let i=0; i<binary.length; i++) bytes[i] = binary.charCodeAt(i);
-      const ctx = _getAudioCtx();
-      if (ctx.state === "suspended") { window.__copilotTTSPending = false; return; }
       ctx.decodeAudioData(bytes.buffer)
         .then(decoded => {
           const src = ctx.createBufferSource();
@@ -415,8 +444,18 @@
     });
   }
 
+  function playAudio(url) {
+    if (!_userGestured) {
+      // No gesture yet — queue for playback once the user interacts
+      _pendingAudio.push(url);
+      return;
+    }
+    _playAudioNow(url);
+  }
+
   // ── Start ─────────────────────────────────────────────────────────────────
-  connectWS();
+  // connectWS() is called inside the chrome.storage.local.get callback above
+  // so it uses the resolved (possibly user-configured) WS_URL.
   console.log("[GoPilot Vision] Observer v2 active — session:", SESSION_ID);
 
 })();

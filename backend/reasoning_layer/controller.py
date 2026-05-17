@@ -167,6 +167,21 @@ def _find_best_field(ctx: dict, hint: str) -> tuple[str | None, str, int]:
 
 # ── Direct fill ────────────────────────────────────────────────────────────
 
+# Noise words stripped before trying to match a field name prefix in the
+# natural-language fill (Tier 1b).
+_NL_NOISE = {
+    "this", "is", "the", "it", "its", "a", "an", "are", "was",
+    "fill", "set", "enter", "put", "as", "to", "with", "for",
+    "please", "can", "you", "i", "want", "need", "just",
+}
+
+# Prefixes that signal "I'm about to name a field + value"
+_THIS_IS_RE = re.compile(
+    r"^(?:this\s+is\s+(?:the\s+)?|it(?:'?s|\s+is)\s+(?:the\s+)?|"
+    r"set\s+(?:the\s+)?|fill\s+(?:in\s+)?(?:the\s+)?)",
+    re.IGNORECASE,
+)
+
 def _direct_fill(
     instruction: str,
     ctx: dict,
@@ -209,6 +224,127 @@ def _direct_fill(
 
     logger.info("Direct fill ✓ '%s' → '%s' [score=%d] = '%s'", field_hint, fid, score, value)
     return ToolCall(field_id=fid, value=value, reason="direct match")
+
+
+def _direct_fill_natural(
+    instruction: str,
+    ctx: dict,
+    calc: list[str],
+    ro: list[str],
+) -> LLMAction | None:
+    """
+    Tier 1b — DOM-aware natural-language fill.
+
+    Handles speech patterns like:
+      "This is the product category 2 wood"
+        → field "product_category_2", value "wood"
+      "product category is chairs"
+        → field "product_category", value "chairs"
+      "supplier ABC Traders"
+        → field matching "supplier", value "ABC Traders"
+
+    Algorithm:
+      1. Strip known STT/command prefixes ("this is the", "it's", etc.)
+      2. For each non-readonly field in DOM order, check whether the
+         remaining instruction starts with the field's name tokens.
+      3. The value is whatever text comes after the matched field name.
+      4. Pick the field with the highest name-match score where a value
+         was found.  Score threshold ≥ 15 to avoid false positives.
+    """
+    text = instruction.strip().rstrip(".,!?")
+
+    # Strip leading command prefix
+    stripped = _THIS_IS_RE.sub("", text).strip()
+    # Also handle "[field name] is [value]" by trying both with and without prefix strip
+    candidates = [stripped, text] if stripped != text else [text]
+
+    best_fid, best_lbl, best_val, best_score = None, "", "", 0
+
+    # Token helper: keep single-digit numbers (for fields like "Category 2")
+    def _toks(s):
+        return [w for w in re.findall(r"[a-z0-9]+", s.lower())
+                if w not in _NL_NOISE and (len(w) > 1 or w.isdigit())]
+
+    for attempt in candidates:
+        if not attempt:
+            continue
+        toks = _toks(attempt)
+        if not toks:
+            continue
+
+        for f in _all_fields(ctx):
+            fid   = f.get("field_id", "")
+            label = f.get("label", "")
+            if not fid or f.get("readonly") or f.get("calculated"):
+                continue
+            if fid in calc or fid in ro:
+                continue
+
+            # Build the field name token list (allow single-digit numbers too)
+            fname_toks = [w for w in re.findall(r"[a-z0-9]+",
+                          (_clean(label) or _clean(fid.replace("_", " "))).lower())
+                          if w not in _NL_NOISE and (len(w) > 1 or w.isdigit())]
+            if not fname_toks:
+                continue
+
+            # Check if the instruction tokens START WITH the field name tokens
+            if len(fname_toks) > len(toks):
+                continue
+
+            if toks[:len(fname_toks)] == fname_toks:
+                # Everything after the field name tokens is the value
+                value_toks = toks[len(fname_toks):]
+                if not value_toks:
+                    continue
+
+                # Reconstruct value from original text (preserve casing/punctuation)
+                # Find where the value starts in the attempt string.
+                # Build a flexible pattern from fname_toks to locate end in original.
+                tok_pattern = r"\s+".join(re.escape(t) for t in fname_toks)
+                m_pos = re.search(tok_pattern, attempt.lower())
+                if m_pos:
+                    raw_val = attempt[m_pos.end():].strip().rstrip(".,!? ")
+                else:
+                    raw_val = " ".join(value_toks)
+
+                # Strip connector words that can appear between field name and value:
+                # "product category 2 is chairs" → strip leading "is "
+                # "quantity to 50" → strip leading "to "
+                raw_val = re.sub(r"^(?:is|to|as|=|:)\s+", "", raw_val, flags=re.IGNORECASE).strip()
+                raw_val = raw_val.rstrip(".,!? ")
+
+                if not raw_val or len(raw_val) < 1:
+                    continue
+
+                s = _score_field(f, fname_toks)
+                if s > best_score:
+                    best_score  = s
+                    best_fid    = fid
+                    best_lbl    = label
+                    best_val    = raw_val
+
+            # Also handle "[field] is [value]" with explicit "is"
+            if "is" in toks:
+                is_idx = toks.index("is")
+                before = toks[:is_idx]
+                after  = toks[is_idx + 1:]
+                if before == fname_toks and after:
+                    s = _score_field(f, fname_toks)
+                    if s > best_score:
+                        best_score = s
+                        best_fid   = fid
+                        best_lbl   = label
+                        # Reconstruct value from original
+                        low2 = attempt.lower()
+                        is_pos = low2.find(" is ")
+                        best_val = attempt[is_pos + 4:].strip().rstrip(".,!? ") if is_pos >= 0 else " ".join(after)
+
+    if not best_fid or best_score < 15 or not best_val:
+        return None
+
+    logger.info("Tier 1b ✓ '%s' → '%s' [score=%d] = '%s'",
+                instruction[:60], best_fid, best_score, best_val)
+    return ToolCall(field_id=best_fid, value=best_val, reason="natural match")
 
 
 # ── Direct explain ─────────────────────────────────────────────────────────
@@ -285,6 +421,13 @@ class ReasoningController:
 
         # ── Tier 1: direct fill — ~5ms ───────────────────────────────────────
         result = _direct_fill(user_instruction, screen_context, calculated_fields, readonly_fields)
+        if result:
+            return result
+
+        # ── Tier 1b: natural-language DOM-aware fill — ~3ms ──────────────────
+        # "This is the product category 2 wood" → field "product_category_2" = "wood"
+        # "supplier is ABC Traders" → supplier field = "ABC Traders"
+        result = _direct_fill_natural(user_instruction, screen_context, calculated_fields, readonly_fields)
         if result:
             return result
 
@@ -369,6 +512,9 @@ class ReasoningController:
 
 
 # ── Singleton ──────────────────────────────────────────────────────────────
+# Keep one ReasoningController alive for the process lifetime.
+# Creating a new one on every request logged "ReasoningController ready" and
+# wasted a mode_selector call (~1ms each).  Re-use the same instance.
 _instance: ReasoningController | None = None
 
 

@@ -153,12 +153,15 @@
     // 8. Fuzzy aria-label match
     for (const el of document.querySelectorAll("[aria-label]")) {
       if (!el.matches(INPUT_SEL)) continue;
-      if (slugMatch(el.getAttribute("aria-label"), needle)) return el;
+      const al = el.getAttribute("aria-label");
+      if (slugMatch(al, needle) || slugMatch(needle, slugOf(al))) return el;
     }
 
-    // 9. Placeholder match
+    // 9. Placeholder match — check both directions so that a short needle like
+    // "category" matches a placeholder like "Enter Product Category".
     for (const el of document.querySelectorAll("input[placeholder], textarea[placeholder]")) {
-      if (slugMatch(el.placeholder, needle)) return el;
+      const ph = el.placeholder;
+      if (slugMatch(ph, needle) || slugMatch(needle, slugOf(ph))) return el;
     }
 
     // 10. Last resort — if only one input on the page matches keyword from needle
@@ -396,6 +399,25 @@
           break;
         }
       }
+    }
+
+    // Fallback 1: original DOM id / name stamped by the extractor.
+    // Reliable even after a React re-render that wipes data-copilot-field-id.
+    if (!el && action.dom_id) {
+      el = document.getElementById(action.dom_id) ||
+           document.querySelector(`[name="${CSS.escape(action.dom_id)}"]`);
+    }
+
+    // Fallback 2: human-readable label forwarded by the backend.
+    // Lets strategy 6 (label text match) run against the full label string.
+    if (!el && action.label) {
+      el = findEl(action.label);
+    }
+
+    // Fallback 3: placeholder text forwarded by the backend.
+    // Useful when the element lost its stamp and has no matching id/label.
+    if (!el && action.placeholder) {
+      el = findEl(action.placeholder);
     }
 
     if (!el) return { ok: false, reason: `Field not found: "${field_id}". Try using the exact label text as field_id.` };

@@ -379,8 +379,8 @@ def _try_dom_answer(instruction: str, context: dict) -> str | None:
                 if tbl_summary:
                     parts.append(tbl_summary)
                     parts.append("Say 'how many pending' or 'show me last 5' to hear details.")
-        except Exception:
-            pass
+        except Exception as _tbl_err:
+            logger.debug("table_reader failed in page_explainer: %s", _tbl_err)
         return " ".join(parts)
 
     # ── "What fields are missing / empty?" ────────────────────────────────

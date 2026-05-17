@@ -48,7 +48,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     threading.Thread(target=_prewarm, daemon=True).start()
 
     # ── Wire up CoPilot Vision Loop ──────────────────────────────────────────
-    from reasoning_layer.controller import ReasoningController
+    from reasoning_layer.controller import ReasoningController, get_controller
     from security.permissions import tool_permission_guard
     from logs.audit_logger import audit_logger
     from model_manager.mode_selector import select_mode
@@ -57,7 +57,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     hw   = engine.hardware
     mode = select_mode(hw)
-    rc   = ReasoningController(mode=mode)
+    rc   = get_controller(mode)
 
     def _reasoning_fn(workflow, screen_context, instruction, session_id):
         from workflow_core.registry import workflow_registry
@@ -190,7 +190,7 @@ async def disable_plugin(plugin_name: str) -> dict:
 # ── AI Workflow Step ───────────────────────────────────────────────────────
 
 from workflow_core.registry import workflow_registry
-from reasoning_layer.controller import ReasoningController
+from reasoning_layer.controller import ReasoningController, get_controller
 from reasoning_layer.schemas import LLMAction, ErrorAction
 from model_manager.mode_selector import select_mode
 
@@ -231,7 +231,7 @@ async def workflow_ai_step(workflow_name: str, body: AIStepRequest) -> dict:
 
     hw = engine.hardware
     mode = select_mode(hw)
-    controller = ReasoningController(mode=mode)
+    controller = get_controller(mode)
 
     action = controller.run(
         workflow_name=workflow_name,
@@ -353,7 +353,7 @@ async def list_audit_sessions() -> dict:
 # ── Autonomous execution ───────────────────────────────────────────────────
 
 from core.executor import AutonomousExecutor, StopReason
-from reasoning_layer.controller import ReasoningController
+from reasoning_layer.controller import ReasoningController, get_controller
 from security.permissions import tool_permission_guard
 from logs.audit_logger import audit_logger
 
@@ -408,7 +408,7 @@ def workflow_autorun(workflow_name: str, body: AutoRunRequest) -> AutoRunRespons
 
     hw         = engine.hardware
     mode       = select_mode(hw)
-    controller = ReasoningController(mode=mode)
+    controller = get_controller(mode)
 
     executor = AutonomousExecutor(
         reasoning_controller=controller,
@@ -518,12 +518,12 @@ def voice_process(
         )
 
     # Build the AI step callable for the voice controller
-    from reasoning_layer.controller import ReasoningController
+    from reasoning_layer.controller import get_controller
     from model_manager.mode_selector import select_mode
 
     hw   = engine.hardware
     mode = select_mode(hw)
-    rc   = ReasoningController(mode=mode)
+    rc   = get_controller(mode)
 
     def ai_step_fn(workflow: str, screen_context: dict, instruction: str, session_id: str) -> dict:
         _wf             = workflow_registry.get_best(workflow, screen_context)
@@ -544,7 +544,8 @@ def voice_process(
             required_fields=_wf.required_fields,
             missing_required=missing_required,
         )
-        return action.model_dump()
+        # run() can return a plain dict (multi_fill path) or a Pydantic model
+        return action if isinstance(action, dict) else action.model_dump()
 
     # Run voice pipeline
     try:
@@ -569,8 +570,8 @@ def voice_process(
         try:
             from voice.page_memory import page_memory_store
             page_memory_store.log_instruction(_tab_sid, result.transcription)
-        except Exception:
-            pass
+        except Exception as _pm_err:
+            logger.debug("page_memory log_instruction failed: %s", _pm_err)
 
     return VoiceResponse(
         transcription          = result.transcription,
@@ -607,6 +608,101 @@ def voice_audio(filename: str) -> FileResponse:
         path=str(path),
         media_type="audio/wav",
         filename=safe,
+    )
+
+
+# ── Text command endpoint ─────────────────────────────────────────────────────
+class VoiceTextRequest(BaseModel):
+    text:           str
+    workflow:       str  = "free"
+    session_id:     str  = ""
+    screen_context: dict = {}
+
+
+@app.post("/voice/text", response_model=VoiceResponse, tags=["voice"])
+def voice_text(body: VoiceTextRequest) -> VoiceResponse:
+    """
+    Text command pipeline: Text → AI step → TTS → WAV.
+
+    Identical to /voice/process but skips STT — accepts typed text directly.
+    Used by the popup text input and any API consumer that already has text.
+
+    Send as JSON:
+      text           = the user's instruction (e.g. "Set category to chairs")
+      workflow       = purchase | supplier | sell | free
+      session_id     = string
+      screen_context = current page DOM context dict
+    """
+    if not body.text or not body.text.strip():
+        raise HTTPException(status_code=400, detail="text is required")
+
+    import time as _time_mod
+    session_id = body.session_id or f"text-{int(_time_mod.time())}"
+
+    from workflow_core.registry import workflow_registry
+    from reasoning_layer.controller import get_controller
+    from model_manager.mode_selector import select_mode
+    from voice.voice_controller import get_voice_controller
+
+    try:
+        workflow_registry.get(body.workflow)
+    except KeyError:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Workflow '{body.workflow}' not found.",
+        )
+
+    hw   = engine.hardware
+    mode = select_mode(hw)
+    rc   = get_controller(mode)
+
+    def ai_step_fn(workflow: str, screen_context: dict, instruction: str, session_id: str) -> dict:
+        _wf             = workflow_registry.get_best(workflow, screen_context)
+        wf_result       = _wf.next_step(screen_context)
+        missing_required = [
+            f["field_id"]
+            for section in screen_context.get("sections", [])
+            for f in section.get("fields", [])
+            if f.get("field_id") in _wf.required_fields
+            and not (f.get("value") or "")
+        ]
+        action = rc.run(
+            workflow_name=workflow,
+            screen_context=screen_context,
+            user_instruction=instruction,
+            next_field=wf_result.next_field,
+            calculated_fields=_wf.calculated_fields,
+            required_fields=_wf.required_fields,
+            missing_required=missing_required,
+        )
+        return action if isinstance(action, dict) else action.model_dump()
+
+    try:
+        controller = get_voice_controller()
+        result = controller.process_text(
+            text=body.text.strip(),
+            workflow_name=body.workflow,
+            screen_context=body.screen_context,
+            session_id=session_id,
+            ai_step_fn=ai_step_fn,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    return VoiceResponse(
+        transcription          = result.transcription,
+        normalised             = result.normalised,
+        ai_response            = result.spoken_response,
+        audio_file             = result.audio_file,
+        action                 = result.ai_action,
+        nav_action             = getattr(result, "nav_action", False),
+        multi_fill_active      = getattr(result, "multi_fill_active", False),
+        detail_mode            = result.detail_mode,
+        submit_guard_triggered = result.submit_guard_triggered,
+        guided_fill_active     = result.guided_fill_active,
+        warning                = result.warning,
     )
 
 
